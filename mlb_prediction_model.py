@@ -142,26 +142,100 @@ class MLBPredictor:
         return games
     
     def get_todays_games(self) -> List[Dict]:
-        data = self._get("schedule", {"date": self.today, "sportId": 1})
+        return self.get_games_for_date(self.today)
+    
+    def get_games_for_date(self, date_str: str) -> List[Dict]:
+        data = self._get("schedule", {"date": date_str, "sportId": 1})
         games = []
         for date_entry in data.get("dates", []):
             for game in date_entry.get("games", []):
                 status = game.get("status", {}).get("statusCode", "")
-                if status in ["S", "P", "PRE", "F"]:
+                if status in ["S", "P", "PRE", "F", "I"]:
                     games.append({
                         "game_pk": game.get("gamePk"),
                         "date": date_entry.get("date"),
                         "status": status,
+                        "status_detailed": game.get("status", {}).get("detailedState", ""),
                         "away_team_id": game.get("teams", {}).get("away", {}).get("team", {}).get("id"),
                         "away_team_name": game.get("teams", {}).get("away", {}).get("team", {}).get("name"),
                         "away_team_abbr": game.get("teams", {}).get("away", {}).get("team", {}).get("abbreviation", ""),
+                        "away_score": game.get("teams", {}).get("away", {}).get("score"),
                         "home_team_id": game.get("teams", {}).get("home", {}).get("team", {}).get("id"),
                         "home_team_name": game.get("teams", {}).get("home", {}).get("team", {}).get("name"),
                         "home_team_abbr": game.get("teams", {}).get("home", {}).get("team", {}).get("abbreviation", ""),
+                        "home_score": game.get("teams", {}).get("home", {}).get("score"),
                         "venue": game.get("venue", {}).get("name"),
-                        "time": game.get("gameDate", "")[:16] if game.get("gameDate") else ""
+                        "venue_city": game.get("venue", {}).get("location", {}).get("city", ""),
+                        "venue_state": game.get("venue", {}).get("location", {}).get("state", ""),
+                        "time": game.get("gameDate", "")[:16] if game.get("gameDate") else "",
+                        "current_inning": game.get("linescore", {}).get("currentInning", ""),
+                        "inning_state": game.get("linescore", {}).get("inningState", ""),
                     })
         return games
+    
+    def get_game_live_details(self, game_pk: int) -> Dict:
+        data = self._get(f"game/{game_pk}/boxscore")
+        
+        details = {
+            "away_hits": 0,
+            "away_errors": 0,
+            "home_hits": 0,
+            "home_errors": 0,
+            "winning_pitcher_name": "",
+            "winning_pitcher_wins": 0,
+            "winning_pitcher_era": 0.0,
+            "losing_pitcher_name": "",
+            "losing_pitcher_losses": 0,
+            "losing_pitcher_era": 0.0,
+            "save_pitcher_name": "",
+        }
+        
+        if data.get("teams"):
+            away = data["teams"].get("away", {})
+            home = data["teams"].get("home", {})
+            
+            details["away_hits"] = away.get("teamStats", {}).get("batting", {}).get("hits", 0)
+            details["away_errors"] = away.get("teamStats", {}).get("fielding", {}).get("errors", 0)
+            details["home_hits"] = home.get("teamStats", {}).get("batting", {}).get("hits", 0)
+            details["home_errors"] = home.get("teamStats", {}).get("fielding", {}).get("errors", 0)
+        
+        info = data.get("info", [])
+        
+        for team_key in ["away", "home"]:
+            team = data.get("teams", {}).get(team_key, {})
+            for pid, pdata in team.get("players", {}).items():
+                person = pdata.get("person", {})
+                full_name = person.get("fullName", "")
+                pitch_stats = pdata.get("stats", {}).get("pitching", {})
+                note = pitch_stats.get("note", "")
+                
+                if "(W," in note:
+                    details["winning_pitcher_name"] = full_name
+                    import re
+                    w_match = re.search(r'W,\s*(\d+)', note)
+                    l_match = re.search(r'L,\s*(\d+)', note)
+                    if w_match:
+                        details["winning_pitcher_wins"] = int(w_match.group(1))
+                    if l_match:
+                        details["winning_pitcher_losses"] = int(l_match.group(1))
+                
+                if "(L," in note and not details["losing_pitcher_name"]:
+                    details["losing_pitcher_name"] = full_name
+                    import re
+                    w_match = re.search(r'W,\s*(\d+)', note)
+                    l_match = re.search(r'L,\s*(\d+)', note)
+                    if w_match:
+                        details["losing_pitcher_wins"] = int(w_match.group(1))
+                    if l_match:
+                        details["losing_pitcher_losses"] = int(l_match.group(1))
+        
+        for item in info:
+            label = item.get("label", "")
+            value = item.get("value", "")
+            if label in ["Save", "SAVE"]:
+                details["save_pitcher_name"] = value.split(".")[0].strip() if "." in value else value
+        
+        return details
     
     def get_recent_games(self, team_id: int, num_games: int = 20) -> List[Dict]:
         start_date = (datetime.now() - timedelta(days=60)).strftime("%Y-%m-%d")
@@ -465,121 +539,154 @@ class MLBPredictor:
             "season": self.season
         }
     
-    def format_prediction_nhl_style(self, prediction: Dict, game_time: str = "", game_status: str = "") -> str:
+    def format_full_calendar(self, game: Dict, prediction: Dict, details: Dict = None) -> str:
         home = prediction["home_team"]
         away = prediction["away_team"]
         
-        line = "─" * 80
+        status = game.get("status", "")
+        is_final = status == "F"
+        is_live = status == "I"
         
         output = []
-        output.append(line)
         
-        status_text = "🏆 FINAL" if game_status == "F" else "📅 PRÓXIMO"
-        output.append(f"⚾ PARTIDO: {away.abbreviation} @ {home.abbreviation} [{status_text}]")
+        away_score = game.get("away_score", 0) or 0
+        home_score = game.get("home_score", 0) or 0
         
-        if game_time:
-            try:
-                dt = datetime.fromisoformat(game_time.replace("Z", "+00:00"))
-                time_str = dt.strftime("%I:%M %p")
-            except:
-                time_str = game_time
-            output.append(f"📅 {time_str}")
+        away_hits = details.get("away_hits", 0) if details else 0
+        away_errors = details.get("away_errors", 0) if details else 0
+        home_hits = details.get("home_hits", 0) if details else 0
+        home_errors = details.get("home_errors", 0) if details else 0
+        
+        output.append("Jueves, 16 de Abril, 2026")
+        output.append("Momios de")
+        output.append("Caliente")
+        output.append("")
+        
+        if is_live:
+            inning = game.get("current_inning", "")
+            if inning:
+                output.append(f"End of {inning}º")
+            output.append("R")
+            output.append("H")
+            output.append("E")
         else:
-            output.append(f"📅 {datetime.now().strftime('%I:%M %p')}")
-        
-        output.append(line)
-        output.append("")
-        output.append(f"🎯 EL MODELO DICE: {prediction['predicted_abbr']} GANA")
-        output.append(f"   Confianza: {prediction['confidence']:.0f}%")
-        output.append(f"   {away.abbreviation}: {prediction['away_prob']:.0f}% chance | {home.abbreviation}: {prediction['home_prob']:.0f}% chance")
-        output.append("")
-        output.append(f"✅ ¿POR QUÉ FAVORECE A {prediction['predicted_abbr']}?")
-        output.append(line)
-        
-        favored_team = "home" if prediction['home_prob'] > prediction['away_prob'] else "away"
-        favored_factors = prediction["factors"][favored_team]
-        other_team = "away" if favored_team == "home" else "home"
-        other_factors = prediction["factors"][other_team]
-        other_abbr = away.abbreviation if favored_team == "home" else home.abbreviation
-        favored_abbr = home.abbreviation if favored_team == "home" else away.abbreviation
-        
-        for factor in favored_factors[:5]:
-            output.append(f"  {factor}")
-        
-        if len(favored_factors) < 5:
-            for i in range(5 - len(favored_factors)):
-                output.append(f"  {favored_abbr} tiene ventaja general")
+            output.append("F")
+            output.append("R")
+            output.append("H")
+            output.append("E")
         
         output.append("")
-        output.append(f"❌ ¿QUÉ FAVORECE A {other_abbr}?")
-        output.append(line)
         
-        for factor in other_factors[:3]:
-            output.append(f"  {factor}")
+        output.append(f"{away.name}")
+        output.append(f"({away.wins}-{away.losses}-{away.games_played - away.wins - away.losses}Visitante)")
+        output.append(f"{away_score}")
+        output.append(f"{away_hits}")
+        output.append(f"{away_errors}")
+        output.append("")
         
-        if len(other_factors) < 3:
-            for i in range(3 - len(other_factors)):
-                output.append(f"  {other_abbr} es competitivo")
+        output.append(f"{home.name}")
+        output.append(f"({home.wins}-{home.losses}-{home.games_played - home.wins - home.losses}Local)")
+        output.append(f"{home_score}")
+        output.append(f"{home_hits}")
+        output.append(f"{home_errors}")
+        
+        if is_live:
+            output.append("B")
+            output.append("S")
+            output.append("O")
+            output.append("")
+            output.append("Última jugada:En juego")
+        elif is_final:
+            output.append("")
+            pred_abbr = prediction['predicted_abbr']
+            
+            win_name = details.get("winning_pitcher_name", "") if details else ""
+            win_wins = details.get("winning_pitcher_wins", 0) if details else 0
+            win_losses = details.get("winning_pitcher_losses", 0) if details else 0
+            lose_name = details.get("losing_pitcher_name", "") if details else ""
+            lose_wins = details.get("losing_pitcher_wins", 0) if details else 0
+            lose_losses = details.get("losing_pitcher_losses", 0) if details else 0
+            save_name = details.get("save_pitcher_name", "") if details else ""
+            
+            output.append("GANA")
+            output.append(f"{win_name}")
+            output.append(f"{win_wins}-{win_losses} ERA")
+            output.append("")
+            output.append("PIERDE")
+            output.append(f"{lose_name}")
+            output.append(f"{lose_wins}-{lose_losses} ERA")
+            
+            if save_name:
+                output.append("")
+                output.append("SALVA")
+                output.append(f"{save_name}")
+            
+            output.append("")
+            output.append("🎯 PREDICCION")
+            output.append(f"Gana: {pred_abbr}")
+            output.append(f"Confianza: {prediction['confidence']:.0f}%")
+        
+        if not is_final and not is_live:
+            game_time = game.get("time", "")
+            if game_time:
+                try:
+                    dt = datetime.fromisoformat(game_time.replace("Z", "+00:00"))
+                    time_str = dt.strftime("%-I:%M %p")
+                except:
+                    time_str = ""
+                output.append("")
+                output.append("Juego")
+                output.append(f"{time_str}")
         
         output.append("")
-        output.append(line)
+        output.append("=" * 40)
         
         return "\n".join(output)
 
 
 def main():
+    import sys
+    
+    date_to_use = None
+    if len(sys.argv) > 1:
+        date_to_use = sys.argv[1]
+    else:
+        date_to_use = datetime.now().strftime("%Y-%m-%d")
+    
     print()
-    print("=" * 80)
-    print("⚾ MLB PREDICTION MODEL - PARTIDOS DE HOY")
-    print("=" * 80)
+    print("📥 Cargando modelo...")
     print()
     
     model = MLBPredictor()
     
-    print("📥 Cargando partidos...")
-    games = model.get_todays_games()
+    games = model.get_games_for_date(date_to_use)
     
     if not games:
-        print("❌ No hay partidos programados para hoy.")
+        print("❌ No hay partidos programados para esta fecha.")
         return
     
     print(f"✅ Partidos detectados: {len(games)}")
     print()
-    print("⏳ Calculando predicciones...")
+    print(f"⏳ Cargando datos de partidos...")
     print()
     
     predictions = []
-    for i, game in enumerate(games):
-        print(f"  [{i+1}/{len(games)}] {game['away_team_abbr']} @ {game['home_team_abbr']}...", end=" ", flush=True)
-        
+    for game in games:
         pred = model.predict_game(
             home_team_id=game["home_team_id"],
             away_team_id=game["away_team_id"]
         )
         pred["game_time"] = game.get("time", "")
-        pred["game_status"] = game.get("status", "")
-        predictions.append(pred)
-        print("✓")
+        
+        details = None
+        if game.get("status") == "F":
+            details = model.get_game_live_details(game["game_pk"])
+        
+        predictions.append((game, pred, details))
     
-    print()
-    print("=" * 80)
-    print("🏆 PREDICCIONES - CALENDARIO")
-    print("=" * 80)
-    
-    for pred in predictions:
-        print(model.format_prediction_nhl_style(pred, pred.get("game_time", ""), pred.get("game_status", "")))
-    
-    print()
-    print("📊 RESUMEN")
-    print("=" * 80)
-    for pred in predictions:
-        home = pred["home_team"]
-        away = pred["away_team"]
-        winner = pred["predicted_abbr"]
-        conf = pred["confidence"]
-        print(f"  {away.abbreviation:3} @ {home.abbreviation:3} → {winner:3} ({conf:.0f}%)")
-    print()
-    print("=" * 80)
+    for game, pred, details in predictions:
+        print(model.format_full_calendar(game, pred, details))
+        print()
 
 
 if __name__ == "__main__":
