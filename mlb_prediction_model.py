@@ -182,7 +182,7 @@ def load_stats_from_csv() -> Dict[int, TeamStats]:
                 home_losses=int(row["home_losses"]) if row["home_losses"] else 0,
                 away_wins=int(row["away_wins"]) if row["away_wins"] else 0,
                 away_losses=int(row["away_losses"]) if row["away_losses"] else 0,
-                run_differential=int(row["run_differential"]) if row["run_differential"] else 0,
+                run_differential=int(float(row["run_differential"])) if row["run_differential"] else 0,
                 games_played=int(row["games_played"]) if row["games_played"] else 0,
                 last_updated=row.get("last_updated", "")
             )
@@ -334,27 +334,8 @@ class MLBPredictor:
         if self.cache_stats and team_id in self.cache_stats:
             return self.cache_stats[team_id]
         
-        standings = self._get("standings", {"season": self.season, "sportId": 1})
-        
-        for record in standings.get("records", []):
-            for team_record in record.get("teamRecords", []):
-                if team_record.get("team", {}).get("id") == team_id:
-                    stats = team_record
-                    break
-        
-        if not any(team_record.get("team", {}).get("id") == team_id 
-                   for record in standings.get("records", []) 
-                   for team_record in record.get("teamRecords", [])):
-            team_data = self._get(f"teams/{team_id}")
-            team_record = team_data.get("teams", [{}])[0]
-            stats = {"team": team_record}
-        
-        for record in standings.get("records", []):
-            for team_record in record.get("teamRecords", []):
-                if team_record.get("team", {}).get("id") == team_id:
-                    stats = team_record
-        
-        team_info = stats.get("team", {})
+        team_data = self._get(f"teams/{team_id}")
+        team_info = team_data.get("teams", [{}])[0]
         
         ts = TeamStats(
             team_id=team_id,
@@ -363,56 +344,69 @@ class MLBPredictor:
             season=self.season,
         )
         
-        splits = stats.get("splits", [])
-        if splits:
-            bs = splits[0].get("stat", {})
-            ts.runs_scored_avg = float(bs.get("runsScoredPerGame", 0))
-            ts.runs_allowed_avg = float(bs.get("runsAllowedPerGame", 0))
-            ts.hits_avg = float(bs.get("hits", 0)) / max(1, int(bs.get("gamesPlayed", 1)))
-            ts.home_runs = float(bs.get("homeRuns", 0))
-            ts.strikeouts = float(bs.get("strikeOuts", 0))
-            ts.walks = float(bs.get("baseOnBalls", 0))
-            ts.obp = float(bs.get("obp", 0))
-            ts.slg = float(bs.get("slg", 0))
-            ts.ops = float(bs.get("ops", 0))
-            ts.era = float(bs.get("era", 0))
-            ts.whip = float(bs.get("whip", 0))
-            ts.k_per_nine = float(bs.get("strikeoutsPer9Inn", 0))
-            ts.bb_per_nine = float(bs.get("walksPer9Inn", 0))
+        recent_games = self.get_recent_games(team_id, days=14)
         
-        ts.wins = stats.get("wins", 0)
-        ts.losses = stats.get("losses", 0)
-        ts.win_pct = ts.wins / max(1, ts.wins + ts.losses)
-        ts.streak = stats.get("streak", {}).get("streakCode", "")
-        ts.games_played = ts.wins + ts.losses
+        if not recent_games:
+            ts.wins = 0
+            ts.losses = 0
+            ts.games_played = 0
+            ts.runs_scored_avg = 0
+            ts.runs_allowed_avg = 0
+        else:
+            home_wins = 0
+            home_losses = 0
+            away_wins = 0
+            away_losses = 0
+            total_runs_scored = 0
+            total_runs_allowed = 0
+            wins = 0
+            losses = 0
+            
+            for game in recent_games:
+                if game.get("home_team_id") == team_id:
+                    scored = game.get("home_score", 0) or 0
+                    allowed = game.get("away_score", 0) or 0
+                    if scored > allowed:
+                        home_wins += 1
+                        wins += 1
+                    else:
+                        home_losses += 1
+                        losses += 1
+                else:
+                    scored = game.get("away_score", 0) or 0
+                    allowed = game.get("home_score", 0) or 0
+                    if scored > allowed:
+                        away_wins += 1
+                        wins += 1
+                    else:
+                        away_losses += 1
+                        losses += 1
+                
+                total_runs_scored += scored
+                total_runs_allowed += allowed
+            
+            games_count = len(recent_games)
+            ts.games_played = games_count
+            ts.wins = wins
+            ts.losses = losses
+            ts.home_wins = home_wins
+            ts.home_losses = home_losses
+            ts.away_wins = away_wins
+            ts.away_losses = away_losses
+            ts.runs_scored_avg = total_runs_scored / games_count if games_count > 0 else 0
+            ts.runs_allowed_avg = total_runs_allowed / games_count if games_count > 0 else 0
+            ts.win_pct = wins / games_count if games_count > 0 else 0.5
+            ts.run_differential = total_runs_scored - total_runs_allowed
         
-        ts.run_differential = ts.runs_scored_avg * ts.games_played - ts.runs_allowed_avg * ts.games_played
+        ts.home_record = f"{ts.home_wins}-{ts.home_losses}"
+        ts.away_record = f"{ts.away_wins}-{ts.away_losses}"
+        ts.last_10 = f"{ts.wins}-{ts.losses}"
         
-        last_10 = stats.get("last10", {})
-        ts.last_10 = f"{last_10.get('wins', 0)}-{last_10.get('losses', 0)}"
-        
-        records = stats.get("records", {})
-        ts.home_record = records.get("homeRecord", "")
-        ts.away_record = records.get("roadRecord", "")
-        
-        if ts.home_record:
-            parts = ts.home_record.split("-")
-            if len(parts) >= 2:
-                ts.home_wins = int(parts[0].split("-")[0] if "-" not in parts[0] else 0)
-                try:
-                    ts.home_wins = int(parts[0])
-                    ts.home_losses = int(parts[1].split("-")[0])
-                except:
-                    pass
-        
-        if ts.away_record:
-            parts = ts.away_record.split("-")
-            if len(parts) >= 2:
-                try:
-                    ts.away_wins = int(parts[0])
-                    ts.away_losses = int(parts[1].split("-")[0])
-                except:
-                    pass
+        ts.era = 4.50
+        ts.whip = 1.35
+        ts.ops = 0.750
+        ts.obp = 0.320
+        ts.slg = 0.430
         
         ts.last_updated = datetime.now().strftime("%Y-%m-%d %H:%M")
         
@@ -423,26 +417,23 @@ class MLBPredictor:
         return ts
     
     def get_all_team_stats(self) -> Dict[int, TeamStats]:
-        print("  📊 Cargando estadísticas de equipos...")
+        print("  📊 Calculando estadísticas de equipos...")
         
-        cached_stats = load_stats_from_csv()
-        today_str = datetime.now().strftime("%Y-%m-%d")
+        print("  ⬇️  Descargando partidos recientes...")
+        all_recent_games = []
+        end_date = datetime.now()
+        for i in range(30):
+            date_str = (end_date - timedelta(days=i)).strftime("%Y-%m-%d")
+            day_games = self.get_games_for_date(date_str)
+            for g in day_games:
+                if g.get("status") == "F":
+                    all_recent_games.append(g)
         
-        if cached_stats:
-            for team_id, stats in cached_stats.items():
-                if stats.last_updated == today_str:
-                    print(f"  ✅ {stats.name}: stats ya actualizadas")
-                    if self.cache_stats is None:
-                        self.cache_stats = {}
-                    self.cache_stats[team_id] = stats
+        print(f"  ✅ {len(all_recent_games)} partidos encontrados")
         
         stats = {}
         for abbr, team_id in TEAM_IDS.items():
-            if self.cache_stats and team_id in self.cache_stats:
-                stats[team_id] = self.cache_stats[team_id]
-                continue
-            
-            print(f"  ⬇️  Descargando stats de {abbr.upper()}...")
+            print(f"  📈 Calculando stats de {abbr.upper()}...")
             ts = self.get_team_stats(team_id)
             if ts:
                 stats[team_id] = ts

@@ -1,11 +1,11 @@
 date,game_pk,status,away_team,home_team,predicted_winner,predicted_abbr,confidence,away_prob,home_prob,away_score,home_score,game_time,venue
-2026-04-16,823396,F,Washington Nationals,Pittsburgh Pirates,Pittsburgh Pirates,PIT,2.91,48.54,51.46,8,7,2026-04-16T16:35,PNC Park
-2026-04-16,824530,F,San Francisco Giants,Cincinnati Reds,Cincinnati Reds,CIN,5.96,47.02,52.98,3,0,2026-04-16T16:40,Great American Ball Park
-2026-04-16,824289,F,Kansas City Royals,Detroit Tigers,Detroit Tigers,DET,11.5,44.25,55.75,9,10,2026-04-16T17:10,Comerica Park
+2026-04-16,823396,F,Washington Nationals,Pittsburgh Pirates,Pittsburgh Pirates,PIT,40.17,29.91,70.09,8,7,2026-04-16T16:35,PNC Park
+2026-04-16,824530,F,San Francisco Giants,Cincinnati Reds,Cincinnati Reds,CIN,14.14,42.93,57.07,3,0,2026-04-16T16:40,Great American Ball Park
+2026-04-16,824289,F,Kansas City Royals,Detroit Tigers,Detroit Tigers,DET,31.55,34.23,65.77,9,10,2026-04-16T17:10,Comerica Park
 2026-04-16,823560,F,Los Angeles Angels,New York Yankees,New York Yankees,NYY,2.91,48.54,51.46,11,4,2026-04-16T17:35,Yankee Stadium
-2026-04-16,823801,F,Toronto Blue Jays,Milwaukee Brewers,Milwaukee Brewers,MIL,5.96,47.02,52.98,1,2,2026-04-16T17:40,American Family Field
-2026-04-16,824614,F,Tampa Bay Rays,Chicago White Sox,Tampa Bay Rays,TB,7.53,53.76,46.24,5,3,2026-04-16T18:10,Rate Field
-2026-04-16,825023,F,Texas Rangers,Athletics,Athletics,OAK,2.91,48.54,51.46,9,6,2026-04-16T19:05,Sutter Health Park
-2026-04-16,824453,F,Baltimore Orioles,Cleveland Guardians,Cleveland Guardians,CLE,11.5,44.25,55.75,2,4,2026-04-16T22:10,Progressive Field
-2026-04-16,824208,F,Colorado Rockies,Houston Astros,Houston Astros,HOU,5.96,47.02,52.98,3,2,2026-04-17T00:10,Daikin Park
-2026-04-16,823313,F,Seattle Mariners,San Diego Padres,San Diego Padres,SD,11.5,44.25,55.75,2,5,2026-04-17T00:40,Petco Park
+2026-04-16,823801,F,Toronto Blue Jays,Milwaukee Brewers,Milwaukee Brewers,MIL,17.68,41.16,58.84,1,2,2026-04-16T17:40,American Family Field
+2026-04-16,824614,F,Tampa Bay Rays,Chicago White Sox,Tampa Bay Rays,TB,0.63,50.32,49.68,5,3,2026-04-16T18:10,Rate Field
+2026-04-16,825023,F,Texas Rangers,Athletics,Athletics,OAK,13.27,43.37,56.63,9,6,2026-04-16T19:05,Sutter Health Park
+2026-04-16,824453,F,Baltimore Orioles,Cleveland Guardians,Cleveland Guardians,CLE,19.3,40.35,59.65,2,4,2026-04-16T22:10,Progressive Field
+2026-04-16,824208,F,Colorado Rockies,Houston Astros,Houston Astros,HOU,15.92,42.04,57.96,3,2,2026-04-17T00:10,Daikin Park
+2026-04-16,823313,F,Seattle Mariners,San Diego Padres,San Diego Padres,SD,33.55,33.23,66.77,2,5,2026-04-17T00:40,Petco Park
