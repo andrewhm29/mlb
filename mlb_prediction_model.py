@@ -5,6 +5,7 @@ MLB Prediction Model - Versión Completa
 Predice TODOS los partidos del día con análisis estilo sportsbook.
 """
 
+import csv
 import requests
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
@@ -644,20 +645,12 @@ class MLBPredictor:
         return "\n".join(output)
 
 
-def main():
-    import sys
-    
-    date_to_use = None
-    if len(sys.argv) > 1:
-        date_to_use = sys.argv[1]
-    else:
-        date_to_use = datetime.now().strftime("%Y-%m-%d")
+def run_predictions_for_date(model: MLBPredictor, date_to_use: str, save_csv: bool = True):
+    from pathlib import Path
     
     print()
     print("📥 Cargando modelo...")
     print()
-    
-    model = MLBPredictor()
     
     games = model.get_games_for_date(date_to_use)
     
@@ -687,6 +680,132 @@ def main():
     for game, pred, details in predictions:
         print(model.format_full_calendar(game, pred, details))
         print()
+    
+    if save_csv:
+        csv_path = Path(__file__).with_name(f"predictions_{date_to_use}.csv")
+        with csv_path.open("w", newline="", encoding="utf-8") as csvfile:
+            fieldnames = [
+                "date",
+                "game_pk",
+                "status",
+                "away_team",
+                "home_team",
+                "predicted_winner",
+                "predicted_abbr",
+                "confidence",
+                "away_prob",
+                "home_prob",
+                "away_score",
+                "home_score",
+                "game_time",
+                "venue",
+            ]
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            
+            for game, pred, _ in predictions:
+                writer.writerow({
+                    "date": game.get("date", ""),
+                    "game_pk": game.get("game_pk", ""),
+                    "status": game.get("status", ""),
+                    "away_team": game.get("away_team_name", ""),
+                    "home_team": game.get("home_team_name", ""),
+                    "predicted_winner": pred.get("predicted_winner", ""),
+                    "predicted_abbr": pred.get("predicted_abbr", ""),
+                    "confidence": round(pred.get("confidence", 0), 2),
+                    "away_prob": round(pred.get("away_prob", 0), 2),
+                    "home_prob": round(pred.get("home_prob", 0), 2),
+                    "away_score": game.get("away_score", ""),
+                    "home_score": game.get("home_score", ""),
+                    "game_time": pred.get("game_time", ""),
+                    "venue": game.get("venue", ""),
+                })
+        
+        print(f"📄 CSV exportado: {csv_path}")
+
+
+def get_date_input(prompt: str = "Fecha (YYYY-MM-DD) [ENTER = hoy]: ") -> str:
+    date_str = input(prompt).strip()
+    if not date_str:
+        return datetime.now().strftime("%Y-%m-%d")
+    try:
+        datetime.strptime(date_str, "%Y-%m-%d")
+        return date_str
+    except ValueError:
+        print("❌ Formato inválido. Usa YYYY-MM-DD")
+        return get_date_input(prompt)
+
+
+def show_menu():
+    print()
+    print("=" * 60)
+    print("⚾  MLB PREDICT - MENÚ PRINCIPAL")
+    print("=" * 60)
+    print()
+    print("  1 — 📅 Ver partidos de HOY")
+    print("  2 — 📆 Ver partidos de AYER")
+    print("  3 — 📅 Elegir fecha específica")
+    print()
+    print("  4 — 📄 Exportar CSV de hoy")
+    print("  5 — 📄 Exportar CSV de ayer")
+    print("  6 — 📄 Exportar CSV de fecha específica")
+    print()
+    print("  0 — 🚪 Salir")
+    print()
+    print("=" * 60)
+
+
+def main():
+    while True:
+        show_menu()
+        choice = input("Elige una opción: ").strip()
+        
+        if choice == "1":
+            date_to_use = datetime.now().strftime("%Y-%m-%d")
+            model = MLBPredictor()
+            run_predictions_for_date(model, date_to_use)
+            input("\n⏎ Presiona ENTER para continuar...")
+            
+        elif choice == "2":
+            date_to_use = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+            model = MLBPredictor()
+            run_predictions_for_date(model, date_to_use)
+            input("\n⏎ Presiona ENTER para continuar...")
+            
+        elif choice == "3":
+            date_to_use = get_date_input()
+            model = MLBPredictor()
+            run_predictions_for_date(model, date_to_use)
+            input("\n⏎ Presiona ENTER para continuar...")
+            
+        elif choice == "4":
+            date_to_use = datetime.now().strftime("%Y-%m-%d")
+            model = MLBPredictor()
+            print(f"\n📄 Exportando CSV para {date_to_use}...")
+            run_predictions_for_date(model, date_to_use, save_csv=True)
+            input("\n⏎ Presiona ENTER para continuar...")
+            
+        elif choice == "5":
+            date_to_use = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+            model = MLBPredictor()
+            print(f"\n📄 Exportando CSV para {date_to_use}...")
+            run_predictions_for_date(model, date_to_use, save_csv=True)
+            input("\n⏎ Presiona ENTER para continuar...")
+            
+        elif choice == "6":
+            date_to_use = get_date_input()
+            model = MLBPredictor()
+            print(f"\n📄 Exportando CSV para {date_to_use}...")
+            run_predictions_for_date(model, date_to_use, save_csv=True)
+            input("\n⏎ Presiona ENTER para continuar...")
+            
+        elif choice == "0":
+            print("\n🚪 ¡Hasta luego!")
+            break
+            
+        else:
+            print("\n❌ Opción inválida. Intenta de nuevo.")
+            input("\n⏎ Presiona ENTER para continuar...")
 
 
 if __name__ == "__main__":
