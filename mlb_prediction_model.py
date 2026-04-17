@@ -572,6 +572,10 @@ class MLBPredictor:
         home_abbr = self.get_team_abbreviation(home_team_id)
         away_abbr = self.get_team_abbreviation(away_team_id)
         
+        predicted_total_runs = (home_stats.runs_scored_avg + away_stats.runs_scored_avg)
+        vegas_total = 8.5
+        predicted_over_prob = min(95, (predicted_total_runs / vegas_total) * 50 + 30)
+        
         return {
             "predicted_winner": predicted_winner,
             "predicted_abbr": predicted_abbr,
@@ -585,7 +589,11 @@ class MLBPredictor:
             "factors_for_winner": factors_for_winner[:4],
             "factors_for_loser": factors_for_loser[:4],
             "winner_abbr": winner_abbr,
-            "loser_abbr": loser_abbr
+            "loser_abbr": loser_abbr,
+            "predicted_total_runs": predicted_total_runs,
+            "vegas_total": vegas_total,
+            "over_prob": predicted_over_prob,
+            "under_prob": 100 - predicted_over_prob
         }
     
     def format_prediction(self, game: Dict, prediction: Dict, details: Dict = None) -> str:
@@ -648,6 +656,21 @@ class MLBPredictor:
         else:
             output.append("  Sin factores en contra")
         
+        predicted_total = prediction.get("predicted_total_runs", 0)
+        vegas_total = prediction.get("vegas_total", 8.5)
+        over_prob = prediction.get("over_prob", 50)
+        under_prob = prediction.get("under_prob", 50)
+        
+        output.append("")
+        output.append("📊 TOTAL ESTIMADO (carreras): " + f"{predicted_total:.1f}")
+        output.append("")
+        
+        ou_recommendation = "UNDER" if predicted_total < vegas_total else "OVER"
+        ou_confidence = max(over_prob, under_prob)
+        
+        output.append(f"🧾 Recomendación modelo: {ou_recommendation} de {vegas_total}")
+        output.append(f"   (pronóstico {predicted_total:.1f} vs línea {vegas_total}, confianza {ou_confidence:.0f}%)")
+        
         if details and is_final:
             output.append("")
             output.append("─" * 80)
@@ -661,6 +684,9 @@ class MLBPredictor:
             if details.get("losing_pitcher_name"):
                 losses = details.get("losing_pitcher_losses", 0)
                 output.append(f"🔴 PIERDE: {details['losing_pitcher_name']} (0-{losses})")
+        
+        output.append("")
+        output.append(f"DATA|{away_abbr}|{home_abbr}|{away_prob:.2f}|{home_prob:.2f}|{predicted_total:.1f}|{vegas_total}|{ou_recommendation}")
         
         return "\n".join(output)
 
