@@ -529,7 +529,8 @@ class MLBPredictor:
         home_prob = home_score / total if total > 0 else 0.5
         away_prob = away_score / total if total > 0 else 0.5
         
-        confidence = abs(home_prob - 0.5) * 100 * 2
+        prob_diff = abs(home_prob - away_prob)
+        confidence = min(95, prob_diff * 150)
         
         predicted_winner = home_stats.name if home_prob > away_prob else away_stats.name
         predicted_abbr = self.get_team_abbreviation(home_team_id) if home_prob > away_prob else self.get_team_abbreviation(away_team_id)
@@ -550,26 +551,23 @@ class MLBPredictor:
         
         if winner_stats.runs_scored_avg > loser_stats.runs_scored_avg:
             diff = winner_stats.runs_scored_avg - loser_stats.runs_scored_avg
-            factors_for_winner.append(f"{winner_abbr} buena ofensiva: {winner_stats.runs_scored_avg:.1f} carreras/juego ⭐⭐")
+            factors_for_winner.append(f"{winner_abbr} tiene buena ofensiva: {winner_stats.runs_scored_avg:.1f} carreras/juego (últimos {winner_stats.games_played}) ⭐⭐")
         
         if winner_stats.runs_allowed_avg < loser_stats.runs_allowed_avg:
             diff = loser_stats.runs_allowed_avg - winner_stats.runs_allowed_avg
-            factors_for_winner.append(f"{winner_abbr} defensa sólida: permite {winner_stats.runs_allowed_avg:.1f} carreras/juego ⭐⭐⭐")
+            factors_for_winner.append(f"{winner_abbr} defensa sólida: permite {winner_stats.runs_allowed_avg:.1f} carreras/juego (últimos {winner_stats.games_played}) ⭐⭐⭐")
         
         if winner_stats.home_wins > loser_stats.away_wins + 2:
-            factors_for_winner.append(f"{winner_abbr} fuerte en casa: {winner_stats.home_wins}-{winner_stats.home_losses} ⭐")
+            factors_for_winner.append(f"{winner_abbr} fuerte en casa: {winner_stats.home_wins}-{winner_stats.home_losses} (últimos {winner_stats.games_played}) ⭐")
         
-        if winner_stats.era < loser_stats.era:
-            factors_for_winner.append(f"{winner_abbr} mejor pitcheo: ERA {winner_stats.era:.2f} vs {loser_stats.era:.2f} ⭐⭐⭐")
-        
-        if winner_stats.ops > loser_stats.ops + 0.05:
-            factors_for_winner.append(f"{winner_abbr} mejor ofensiva: OPS {winner_stats.ops:.3f} vs {loser_stats.ops:.3f} ⭐")
+        if winner_stats.run_differential > loser_stats.run_differential + 5:
+            factors_for_winner.append(f"{winner_abbr} mejor run differential: +{winner_stats.run_differential:.0f} vs {loser_stats.run_differential:.0f} (últimos {winner_stats.games_played}) ⭐⭐")
         
         if loser_stats.runs_scored_avg > 4.5:
-            factors_for_loser.append(f"{loser_abbr} tiene buena ofensiva pero no le alcanza ⭐")
+            factors_for_loser.append(f"{loser_abbr} tiene buena ofensiva pero no le alcanza (últimos {loser_stats.games_played}) ⭐")
         
         if loser_stats.home_wins < loser_stats.home_losses:
-            factors_for_loser.append(f"{loser_abbr} débil en casa: {loser_stats.home_wins}-{loser_stats.home_losses} ⭐")
+            factors_for_loser.append(f"{loser_abbr} débil en casa: {loser_stats.home_wins}-{loser_stats.home_losses} (últimos {loser_stats.games_played}) ⭐")
         
         home_abbr = self.get_team_abbreviation(home_team_id)
         away_abbr = self.get_team_abbreviation(away_team_id)
