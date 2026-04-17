@@ -543,6 +543,46 @@ class MLBPredictor:
         predicted_winner = home_stats.name if home_prob > away_prob else away_stats.name
         predicted_abbr = self.get_team_abbreviation(home_team_id) if home_prob > away_prob else self.get_team_abbreviation(away_team_id)
         
+        factors_for_winner = []
+        factors_for_loser = []
+        
+        if home_prob > away_prob:
+            winner_stats = home_stats
+            loser_stats = away_stats
+            winner_abbr = self.get_team_abbreviation(home_team_id)
+            loser_abbr = self.get_team_abbreviation(away_team_id)
+        else:
+            winner_stats = away_stats
+            loser_stats = home_stats
+            winner_abbr = self.get_team_abbreviation(away_team_id)
+            loser_abbr = self.get_team_abbreviation(home_team_id)
+        
+        if winner_stats.runs_scored_avg > loser_stats.runs_scored_avg:
+            diff = winner_stats.runs_scored_avg - loser_stats.runs_scored_avg
+            factors_for_winner.append(f"{winner_abbr} buena ofensiva: {winner_stats.runs_scored_avg:.1f} carreras/juego ⭐⭐")
+        
+        if winner_stats.runs_allowed_avg < loser_stats.runs_allowed_avg:
+            diff = loser_stats.runs_allowed_avg - winner_stats.runs_allowed_avg
+            factors_for_winner.append(f"{winner_abbr} defensa sólida: permite {winner_stats.runs_allowed_avg:.1f} carreras/juego ⭐⭐⭐")
+        
+        if winner_stats.home_wins > loser_stats.away_wins + 2:
+            factors_for_winner.append(f"{winner_abbr} fuerte en casa: {winner_stats.home_wins}-{winner_stats.home_losses} ⭐")
+        
+        if winner_stats.era < loser_stats.era:
+            factors_for_winner.append(f"{winner_abbr} mejor pitcheo: ERA {winner_stats.era:.2f} vs {loser_stats.era:.2f} ⭐⭐⭐")
+        
+        if winner_stats.ops > loser_stats.ops + 0.05:
+            factors_for_winner.append(f"{winner_abbr} mejor ofensiva: OPS {winner_stats.ops:.3f} vs {loser_stats.ops:.3f} ⭐")
+        
+        if loser_stats.runs_scored_avg > 4.5:
+            factors_for_loser.append(f"{loser_abbr} tiene buena ofensiva pero no le alcanza ⭐")
+        
+        if loser_stats.home_wins < loser_stats.home_losses:
+            factors_for_loser.append(f"{loser_abbr} débil en casa: {loser_stats.home_wins}-{loser_stats.home_losses} ⭐")
+        
+        home_abbr = self.get_team_abbreviation(home_team_id)
+        away_abbr = self.get_team_abbreviation(away_team_id)
+        
         return {
             "predicted_winner": predicted_winner,
             "predicted_abbr": predicted_abbr,
@@ -550,118 +590,88 @@ class MLBPredictor:
             "home_prob": home_prob * 100,
             "away_prob": away_prob * 100,
             "home_stats": home_stats,
-            "away_stats": away_stats
+            "away_stats": away_stats,
+            "home_abbr": home_abbr,
+            "away_abbr": away_abbr,
+            "factors_for_winner": factors_for_winner[:4],
+            "factors_for_loser": factors_for_loser[:4],
+            "winner_abbr": winner_abbr,
+            "loser_abbr": loser_abbr
         }
     
-    def format_full_calendar(self, game: Dict, prediction: Dict, details: Dict = None) -> str:
+    def format_prediction(self, game: Dict, prediction: Dict, details: Dict = None) -> str:
         is_final = game.get("status") == "F"
-        is_live = game.get("status") == "I"
         
-        date_obj = datetime.strptime(game.get("date", ""), "%Y-%m-%d")
-        dia_es = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"][date_obj.weekday()]
-        mes_es = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", 
-                  "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"][date_obj.month - 1]
-        date_str = f"{dia_es}, {date_obj.day} de {mes_es}, {date_obj.year}"
+        away_abbr = prediction.get("away_abbr", "") or self.get_team_abbreviation(game.get("away_team_id", 0))
+        home_abbr = prediction.get("home_abbr", "") or self.get_team_abbreviation(game.get("home_team_id", 0))
+        
+        game_time = game.get("time", "")
+        if game_time:
+            try:
+                dt = datetime.fromisoformat(game_time.replace("Z", "+00:00"))
+                time_str = dt.strftime("%-I:%M %p")
+            except:
+                time_str = "Por definir"
+        else:
+            time_str = "Por definir"
         
         output = []
-        output.append("")
-        output.append(date_str)
-        output.append("Momios de")
-        output.append("Caliente")
-        output.append("")
         
+        output.append("─" * 80)
+        output.append(f"⚾️ PARTIDO: {away_abbr} @ {home_abbr}")
+        output.append(f"📅 {time_str}")
         if is_final:
-            output.append("F")
-        elif is_live:
-            inning = game.get("current_inning", "")
-            inning_state = game.get("inning_state", "")
-            output.append(f"{inning}")
-        
-        output.append("R")
-        output.append("H")
-        output.append("E")
+            away_score = game.get("away_score", "")
+            home_score = game.get("home_score", "")
+            output.append(f"🏁 FINAL: {away_abbr} {away_score} - {home_score} {home_abbr}")
+        output.append("─" * 80)
         output.append("")
         
-        away_name = game.get("away_team_name", "")
-        away_abbr = game.get("away_team_abbr", "")
-        away_record = prediction.get("away_stats", TeamStats(team_id=0)).wins or "?"
-        away_losses = prediction.get("away_stats", TeamStats(team_id=0)).losses or "?"
+        pred_abbr = prediction.get("predicted_abbr", "")
+        confidence = prediction.get("confidence", 0)
         
-        output.append(f"{away_name}")
-        output.append(f"({away_record}-{away_losses}-0Visitante)")
-        output.append(str(game.get("away_score", "")))
+        output.append(f"🎯 EL MODELO DICE: {pred_abbr} GANA")
+        output.append(f"   Confianza: {confidence:.0f}%")
         
-        if details and is_final:
-            output.append(str(details.get("away_hits", "")))
-            output.append(str(details.get("away_errors", "")))
-        elif is_live:
-            output.append("")
-            output.append("")
-        else:
-            output.append("")
-            output.append("")
-        
-        home_name = game.get("home_team_name", "")
-        home_abbr = game.get("home_team_abbr", "")
-        home_wins = prediction.get("home_stats", TeamStats(team_id=0)).wins or "?"
-        home_losses = prediction.get("home_stats", TeamStats(team_id=0)).losses or "?"
+        away_prob = prediction.get("away_prob", 0)
+        home_prob = prediction.get("home_prob", 0)
+        output.append(f"   {away_abbr}: {away_prob:.0f}% chance | {home_abbr}: {home_prob:.0f}% chance")
         
         output.append("")
-        output.append(f"{home_name}")
-        output.append(f"({home_wins}-{home_losses}-0Local)")
-        output.append(str(game.get("home_score", "")))
+        output.append("✅ ¿POR QUÉ FAVORECE A " + prediction.get("winner_abbr", pred_abbr) + "?")
+        output.append("─" * 80)
         
-        if details and is_final:
-            output.append(str(details.get("home_hits", "")))
-            output.append(str(details.get("home_errors", "")))
-        elif is_live:
-            output.append("")
-            output.append("")
+        factors_winner = prediction.get("factors_for_winner", [])
+        if factors_winner:
+            for factor in factors_winner:
+                output.append(f"  {factor}")
         else:
-            output.append("")
-            output.append("")
+            output.append("  Sin factores claros")
+        
+        output.append("")
+        output.append("❌ ¿QUÉ FAVORECE A " + prediction.get("loser_abbr", "") + "?")
+        output.append("─" * 80)
+        
+        factors_loser = prediction.get("factors_for_loser", [])
+        if factors_loser:
+            for factor in factors_loser:
+                output.append(f"  {factor}")
+        else:
+            output.append("  Sin factores en contra")
         
         if details and is_final:
+            output.append("")
+            output.append("─" * 80)
+            output.append("📊 RESULTADO FINAL")
+            output.append("─" * 80)
+            
             if details.get("winning_pitcher_name"):
-                output.append("")
-                output.append("GANA")
-                output.append(details["winning_pitcher_name"])
                 wins = details.get("winning_pitcher_wins", 0)
-                output.append(f"{wins}-0 ERA")
+                output.append(f"🟢 GANA: {details['winning_pitcher_name']} ({wins}-0)")
             
             if details.get("losing_pitcher_name"):
-                output.append("")
-                output.append("PIERDE")
-                output.append(details["losing_pitcher_name"])
                 losses = details.get("losing_pitcher_losses", 0)
-                output.append(f"0-{losses} ERA")
-            
-            save_name = details.get("save_pitcher_name", "")
-            if save_name:
-                output.append("")
-                output.append("SALVA")
-                output.append(save_name)
-            
-            output.append("")
-            output.append("🎯 PREDICCION")
-            pred_abbr = prediction.get("predicted_abbr", "")
-            output.append(f"Gana: {pred_abbr}")
-            output.append(f"Confianza: {prediction['confidence']:.0f}%")
-        
-        if not is_final and not is_live:
-            game_time = game.get("time", "")
-            if game_time:
-                try:
-                    dt = datetime.fromisoformat(game_time.replace("Z", "+00:00"))
-                    time_str = dt.strftime("%-I:%M %p")
-                except:
-                    time_str = ""
-                output.append("")
-                output.append("Juego")
-                output.append(time_str)
-        
-        output.append("")
-        output.append("=" * 40)
+                output.append(f"🔴 PIERDE: {details['losing_pitcher_name']} (0-{losses})")
         
         return "\n".join(output)
 
@@ -738,7 +748,8 @@ def run_predictions_for_date(model: MLBPredictor, date_to_use: str, save_csv: bo
         predictions.append((game, pred, details))
     
     for game, pred, details in predictions:
-        print(model.format_full_calendar(game, pred, details))
+        print(model.format_prediction(game, pred, details))
+        print()
     
     if save_csv:
         csv_path = Path(__file__).with_name(f"predictions_{date_to_use}.csv")
