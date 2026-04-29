@@ -530,7 +530,10 @@ class MLBPredictor:
         away_prob = away_score / total if total > 0 else 0.5
         
         prob_diff = abs(home_prob - away_prob)
-        confidence = min(95, prob_diff * 150)
+        # Escala de confianza tipo app: siempre entre 50% y 95%.
+        # Si el juego es parejo (50/50), la confianza muestra 50%.
+        # Mientras mayor sea la diferencia entre probabilidades, sube hasta 95%.
+        confidence = min(95, 50 + (prob_diff * 112.5))
         
         predicted_winner = home_stats.name if home_prob > away_prob else away_stats.name
         predicted_abbr = self.get_team_abbreviation(home_team_id) if home_prob > away_prob else self.get_team_abbreviation(away_team_id)
@@ -551,23 +554,38 @@ class MLBPredictor:
         
         if winner_stats.runs_scored_avg > loser_stats.runs_scored_avg:
             diff = winner_stats.runs_scored_avg - loser_stats.runs_scored_avg
-            factors_for_winner.append(f"{winner_abbr} tiene buena ofensiva: {winner_stats.runs_scored_avg:.1f} carreras/juego (últimos {winner_stats.games_played}) ⭐⭐")
+            factors_for_winner.append(
+                f"{winner_abbr} bateo en buen momento: anota {winner_stats.runs_scored_avg:.1f} carreras/juego "
+                f"(ventaja de +{diff:.1f} en producción ofensiva) ⭐⭐"
+            )
         
         if winner_stats.runs_allowed_avg < loser_stats.runs_allowed_avg:
             diff = loser_stats.runs_allowed_avg - winner_stats.runs_allowed_avg
-            factors_for_winner.append(f"{winner_abbr} defensa sólida: permite {winner_stats.runs_allowed_avg:.1f} carreras/juego (últimos {winner_stats.games_played}) ⭐⭐⭐")
+            factors_for_winner.append(
+                f"{winner_abbr} pitcheo más sólido: permite {winner_stats.runs_allowed_avg:.1f} carreras/juego "
+                f"(mejora de {diff:.1f} vs rival) ⭐⭐⭐"
+            )
         
         if winner_stats.home_wins > loser_stats.away_wins + 2:
-            factors_for_winner.append(f"{winner_abbr} fuerte en casa: {winner_stats.home_wins}-{winner_stats.home_losses} (últimos {winner_stats.games_played}) ⭐")
+            factors_for_winner.append(
+                f"{winner_abbr} se hace fuerte en su parque: récord local {winner_stats.home_wins}-{winner_stats.home_losses} ⭐"
+            )
         
         if winner_stats.run_differential > loser_stats.run_differential + 5:
-            factors_for_winner.append(f"{winner_abbr} mejor run differential: +{winner_stats.run_differential:.0f} vs {loser_stats.run_differential:.0f} (últimos {winner_stats.games_played}) ⭐⭐")
+            factors_for_winner.append(
+                f"{winner_abbr} domina el diferencial de carreras: {winner_stats.run_differential:+.0f} vs "
+                f"{loser_stats.run_differential:+.0f} ⭐⭐"
+            )
         
         if loser_stats.runs_scored_avg > 4.5:
-            factors_for_loser.append(f"{loser_abbr} tiene buena ofensiva pero no le alcanza (últimos {loser_stats.games_played}) ⭐")
+            factors_for_loser.append(
+                f"{loser_abbr} también produce carreras ({loser_stats.runs_scored_avg:.1f}/juego), puede responder con el bate ⭐"
+            )
         
         if loser_stats.home_wins < loser_stats.home_losses:
-            factors_for_loser.append(f"{loser_abbr} débil en casa: {loser_stats.home_wins}-{loser_stats.home_losses} (últimos {loser_stats.games_played}) ⭐")
+            factors_for_loser.append(
+                f"{loser_abbr} llega con irregularidad reciente: récord de {loser_stats.wins}-{loser_stats.losses} ⭐"
+            )
         
         home_abbr = self.get_team_abbreviation(home_team_id)
         away_abbr = self.get_team_abbreviation(away_team_id)
@@ -663,7 +681,6 @@ class MLBPredictor:
                 output.append(f"🔴 PIERDE: {details['losing_pitcher_name']} (0-{losses})")
         
         output.append("")
-        output.append(f"DATA|{away_abbr}|{home_abbr}|{away_prob:.2f}|{home_prob:.2f}")
         
         return "\n".join(output)
 
@@ -723,7 +740,13 @@ def run_predictions_for_date(model: MLBPredictor, date_to_use: str, save_csv: bo
         return
     
     print(f"\n✅ Partidos detectados: {len(games)}")
-    print(f"⏳ Cargando datos de partidos...")
+    print("\n📥 Cargando modelo...")
+    print(f"\n⏳ Calculando {len(games)} predicción(es)...")
+    print()
+    print("=" * 80)
+    print("⚾ PREDICCIONES - CALENDARIO")
+    print("=" * 80)
+    print()
     
     predictions = []
     for game in games:
