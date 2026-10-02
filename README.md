@@ -22,19 +22,29 @@ pip install -r requirements.txt
 
 ### Predicciones
 
-**Dónde ejecutarlo:** en la carpeta raíz del proyecto (la que contiene `requirements.txt`, `mlb_prediction_model.py` y la carpeta `scripts/`).
+Igual que en NHL: un script de calendario **sin menú**. Ejecútalo desde la raíz del proyecto (la carpeta que contiene `requirements.txt` y `scripts/`).
 
 ```bash
 pip install -r requirements.txt   # solo la primera vez (o si cambian dependencias)
-python3 scripts/00_menu.py
+python3 scripts/01_download.py --from-year 2010    # historial 2010 → hoy
+python3 scripts/05_predict.py
+python3 scripts/05_predict.py
 ```
 
-**Comando recomendado:** `python3 scripts/00_menu.py` — añade la raíz del proyecto a `sys.path` y abre el menú interactivo.
-
-**Alternativa equivalente** (solo si ya estás en la raíz del repo):
+Por defecto usa **hoy** (fecha local del sistema). Para otra fecha:
 
 ```bash
-python3 mlb_prediction_model.py
+python3 scripts/05_predict.py --date 2026-05-05
+```
+
+(`YYYY-MM-DD`)
+
+Imprime las predicciones en consola y escribe `predictions_<fecha>.csv` en la raíz del repo.
+
+**Menú interactivo** (hoy / ayer / fecha / sync / exportar CSV):
+
+```bash
+python3 scripts/00_menu.py
 ```
 
 #### Opciones del menú
@@ -47,6 +57,7 @@ python3 mlb_prediction_model.py
 | **4** | Sincroniza datos (partidos finalizados de ayer + estadísticas de equipos). |
 | **5** | Misma lógica que **1**, mostrando mensaje de exportación; enfocado en CSV de hoy. |
 | **6** | Misma lógica que **2**, para CSV de ayer. |
+| **A** | Descarga historial **2010 → hoy** a `data/games_history.csv`. |
 | **0** | Salir. |
 
 Tras cada acción el programa puede pedir que pulses **Enter** para volver al menú.
@@ -60,6 +71,36 @@ Tras cada acción el programa puede pedir que pulses **Enter** para volver al me
 
 ARI, ATL, BAL, BOS, CHC, CIN, CLE, COL, CWS, DET, HOU, KC, LAA, LAD, MIA, MIL, MIN, NYM, NYY, OAK, PHI, PIT, SD, SEA, SF, STL, TB, TEX, TOR, WAS
 
-## Data Source
+## Data Source (MLB Stats API)
 
-Datos proporcionados por la MLB Stats API oficial (gratis, sin clave requerida).
+Datos de la [MLB Stats API](https://statsapi.mlb.com/api/v1) oficial. **Gratis, sin API key.** El cliente está en `mlb_api.py`.
+
+| Endpoint | Uso |
+|----------|-----|
+| `GET /api/v1/schedule?sportId=1&season=YYYY&gameTypes=R,F,D,L,W` | **Historial por temporada** (2010, 2011, …). Regular + playoffs |
+| `GET /api/v1/schedule?...&hydrate=probablePitcher,team,linescore,venue` | Calendario del día **con abridores** |
+| `GET /api/v1/people/{id}/stats?stats=season&group=pitching` | ERA / WHIP / K9 del abridor |
+| `GET /api/v1/teams/stats?...&stats=byDateRange` | Forma reciente (últimos 30 días) |
+| `GET /api/v1/teams/stats?group=hitting&stats=season` | OPS, OBP, SLG, carreras de temporada |
+| `GET /api/v1/teams/stats?group=pitching&stats=season` | ERA, WHIP de staff |
+| `GET /api/v1/standings?leagueId=103,104` | W-L, casa/visita, racha, run differential |
+| `GET /api/v1/game/{gamePk}/boxscore` | Boxscore si el partido ya terminó |
+
+Igual que NHL (`scripts/01_download.py`):
+
+```bash
+# Historial de temporadas (la misma Stats API; hay datos desde ~1901).
+# Desde 2010 hasta el año actual:
+python3 scripts/01_download.py --from-year 2010
+
+# Solo ayer + stats de esta temporada:
+python3 scripts/01_download.py
+```
+
+El historial queda en `data/games_history.csv` (partidos finalizados, regular + playoffs). El head-to-head de las predicciones usa ese archivo, recortado a **antes** de la fecha del partido.
+
+Luego predicciones:
+
+```bash
+python3 scripts/05_predict.py
+```

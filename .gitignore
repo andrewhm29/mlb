@@ -14,6 +14,7 @@ build/
 .coverage
 *.log
 .DS_Store
+predictions_*.csv
 .idea/
 .vscode/
 *.swp

@@ -5,15 +5,19 @@ MLB Prediction Model - Versión con Datos Locales
 Usa CSV locales para no descargar todo cada vez.
 """
 
+from __future__ import annotations
+
+import argparse
 import csv
 import os
-import requests
+import sys
+import time
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Tuple
 from pathlib import Path
 
-API_BASE = "https://statsapi.mlb.com/api/v1"
+from mlb_api import MlbStatsClient, _to_float, _to_int
 
 DATA_DIR = Path(__file__).parent / "data"
 GAMES_CSV = DATA_DIR / "games_history.csv"
@@ -74,6 +78,14 @@ class TeamStats:
     last_updated: str = ""
 
 
+GAMES_CSV_FIELDS = [
+    "game_pk", "date", "season", "game_type", "status",
+    "away_team_id", "away_team_name", "away_team_abbr", "away_score",
+    "home_team_id", "home_team_name", "home_team_abbr", "home_score",
+    "venue", "game_time",
+]
+
+
 def ensure_data_dir():
     DATA_DIR.mkdir(exist_ok=True)
 
@@ -83,12 +95,7 @@ def init_games_csv():
     if not GAMES_CSV.exists():
         with open(GAMES_CSV, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow([
-                "game_pk", "date", "status",
-                "away_team_id", "away_team_name", "away_team_abbr", "away_score",
-                "home_team_id", "home_team_name", "home_team_abbr", "home_score",
-                "venue", "game_time"
-            ])
+            writer.writerow(GAMES_CSV_FIELDS)
 
 
 def init_stats_csv():
@@ -131,6 +138,8 @@ def save_game_to_csv(game: Dict):
             writer.writerow([
                 game.get("game_pk", ""),
                 game.get("date", ""),
+                game.get("season", ""),
+                game.get("game_type", ""),
                 game.get("status", ""),
                 game.get("away_team_id", ""),
                 game.get("away_team_name", ""),
@@ -141,8 +150,69 @@ def save_game_to_csv(game: Dict):
                 game.get("home_team_abbr", ""),
                 game.get("home_score", ""),
                 game.get("venue", ""),
-                game.get("game_time", "")
+                game.get("game_time") or game.get("time", ""),
             ])
+
+
+def save_games_history(games: List[Dict], merge: bool = True) -> int:
+    """Escribe el historial de partidos (2010+) en data/games_history.csv."""
+    ensure_data_dir()
+    by_pk: Dict[str, Dict] = {}
+    if merge and GAMES_CSV.exists():
+        for row in load_games_from_csv():
+            pk = str(row.get("game_pk") or "")
+            if pk:
+                by_pk[pk] = row
+    for game in games:
+        pk = str(game.get("game_pk") or "")
+        if not pk:
+            continue
+        by_pk[pk] = {
+            "game_pk": pk,
+            "date": game.get("date", ""),
+            "season": game.get("season", ""),
+            "game_type": game.get("game_type", ""),
+            "status": game.get("status", ""),
+            "away_team_id": game.get("away_team_id", ""),
+            "away_team_name": game.get("away_team_name", ""),
+            "away_team_abbr": game.get("away_team_abbr", ""),
+            "away_score": game.get("away_score", ""),
+            "home_team_id": game.get("home_team_id", ""),
+            "home_team_name": game.get("home_team_name", ""),
+            "home_team_abbr": game.get("home_team_abbr", ""),
+            "home_score": game.get("home_score", ""),
+            "venue": game.get("venue", ""),
+            "game_time": game.get("game_time") or game.get("time", ""),
+        }
+    rows = sorted(by_pk.values(), key=lambda r: (str(r.get("date") or ""), str(r.get("game_pk") or "")))
+    with open(GAMES_CSV, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=GAMES_CSV_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    return len(rows)
+
+
+def download_history(from_year: int = 2010, to_year: Optional[int] = None) -> int:
+    to_year = to_year or datetime.now().year
+    if from_year > to_year:
+        print("❌ from-year no puede ser mayor que to-year")
+        return 1
+    print()
+    print("=" * 60)
+    print(f"📥 HISTORIAL MLB Stats API  {from_year} → {to_year}")
+    print("=" * 60)
+    client = MlbStatsClient(timeout=90)
+    all_final: List[Dict] = []
+    for year in range(from_year, to_year + 1):
+        print(f"  ⬇️  Temporada {year}...", flush=True)
+        games = client.schedule_season(year)
+        finals = [g for g in games if g.get("status") == "F"]
+        print(f"     {len(finals)} partidos finalizados")
+        all_final.extend(finals)
+        time.sleep(0.35)
+    total = save_games_history(all_final, merge=True)
+    print(f"\n✅ Guardado: {total} partidos en {GAMES_CSV}")
+    return 0
 
 
 def load_stats_from_csv() -> Dict[int, TeamStats]:
@@ -222,21 +292,35 @@ def save_stats_to_csv(stats: Dict[int, TeamStats]):
 
 class MLBPredictor:
     def __init__(self, season: int = None):
-        self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "MLB-Predictor/1.0"})
+        self.api = MlbStatsClient()
+        self.session = self.api.session
         self.today = datetime.now().strftime("%Y-%m-%d")
         self.season = season or datetime.now().year
         self.cache_stats = None
-    
+        self._hitting: Optional[Dict[int, Dict]] = None
+        self._pitching: Optional[Dict[int, Dict]] = None
+        self._hitting_l30: Optional[Dict[int, Dict]] = None
+        self._standings: Optional[Dict[int, Dict]] = None
+        self._pitcher_cache: Dict[int, Dict] = {}
+
     def _get(self, endpoint: str, params: dict = None) -> dict:
-        url = f"{API_BASE}/{endpoint}"
-        try:
-            response = self.session.get(url, params=params, timeout=15)
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            print(f"  ⚠️  API Error: {e}")
-            return {}
+        return self.api.get(endpoint, params)
+
+    def _ensure_season_tables(self) -> None:
+        if self._hitting is not None and self._pitching is not None and self._standings is not None:
+            return
+        print("  ⬇️  MLB Stats API: temporada + últimos 30 días + standings...")
+        self._hitting = self.api.season_group_stats(self.season, "hitting")
+        self._pitching = self.api.season_group_stats(self.season, "pitching")
+        self._standings = self.api.standings(self.season)
+        end = datetime.now()
+        start = end - timedelta(days=30)
+        self._hitting_l30 = self.api.season_group_stats(
+            self.season,
+            "hitting",
+            start_date=start.strftime("%Y-%m-%d"),
+            end_date=end.strftime("%Y-%m-%d"),
+        )
     
     def get_team_abbreviation(self, team_id: int) -> str:
         if team_id in TEAM_NAMES:
@@ -247,36 +331,18 @@ class MLBPredictor:
         return "UNK"
     
     def get_games_for_date(self, date_str: str) -> List[Dict]:
-        data = self._get("schedule", {"date": date_str, "sportId": 1})
-        games = []
-        for date_entry in data.get("dates", []):
-            for game in date_entry.get("games", []):
-                status = game.get("status", {}).get("statusCode", "")
-                if status in ["S", "P", "PRE", "F", "I"]:
-                    games.append({
-                        "game_pk": game.get("gamePk"),
-                        "date": date_entry.get("date"),
-                        "status": status,
-                        "status_detailed": game.get("status", {}).get("detailedState", ""),
-                        "away_team_id": game.get("teams", {}).get("away", {}).get("team", {}).get("id"),
-                        "away_team_name": game.get("teams", {}).get("away", {}).get("team", {}).get("name"),
-                        "away_team_abbr": game.get("teams", {}).get("away", {}).get("team", {}).get("abbreviation", ""),
-                        "away_score": game.get("teams", {}).get("away", {}).get("score"),
-                        "home_team_id": game.get("teams", {}).get("home", {}).get("team", {}).get("id"),
-                        "home_team_name": game.get("teams", {}).get("home", {}).get("team", {}).get("name"),
-                        "home_team_abbr": game.get("teams", {}).get("home", {}).get("team", {}).get("abbreviation", ""),
-                        "home_score": game.get("teams", {}).get("home", {}).get("score"),
-                        "venue": game.get("venue", {}).get("name"),
-                        "venue_city": game.get("venue", {}).get("location", {}).get("city", ""),
-                        "venue_state": game.get("venue", {}).get("location", {}).get("state", ""),
-                        "time": game.get("gameDate", "")[:16] if game.get("gameDate") else "",
-                        "current_inning": game.get("linescore", {}).get("currentInning", ""),
-                        "inning_state": game.get("linescore", {}).get("inningState", ""),
-                    })
+        games = self.api.schedule(date=date_str)
+        for game in games:
+            hid = game.get("home_team_id")
+            aid = game.get("away_team_id")
+            if not game.get("home_team_abbr") and hid:
+                game["home_team_abbr"] = self.get_team_abbreviation(int(hid))
+            if not game.get("away_team_abbr") and aid:
+                game["away_team_abbr"] = self.get_team_abbreviation(int(aid))
         return games
     
     def get_game_live_details(self, game_pk: int) -> Dict:
-        data = self._get(f"game/{game_pk}/boxscore")
+        data = self.api.boxscore(game_pk)
         
         details = {
             "away_hits": 0,
@@ -333,165 +399,163 @@ class MLBPredictor:
     def get_team_stats(self, team_id: int) -> Optional[TeamStats]:
         if self.cache_stats and team_id in self.cache_stats:
             return self.cache_stats[team_id]
-        
-        team_data = self._get(f"teams/{team_id}")
-        team_info = team_data.get("teams", [{}])[0]
-        
+
+        self._ensure_season_tables()
+        hitting = (self._hitting or {}).get(team_id) or {}
+        pitching = (self._pitching or {}).get(team_id) or {}
+        standing = (self._standings or {}).get(team_id) or {}
+
+        gp = _to_int(hitting.get("gamesPlayed") or standing.get("games_played"))
+        runs = _to_float(hitting.get("runs"))
+        runs_allowed = _to_float(pitching.get("runs"))
+        hits = _to_float(hitting.get("hits"))
+
         ts = TeamStats(
             team_id=team_id,
-            name=team_info.get("name", ""),
-            abbreviation=team_info.get("abbreviation", ""),
+            name=standing.get("name") or hitting.get("_team_name") or "",
+            abbreviation=self.get_team_abbreviation(team_id),
             season=self.season,
+            runs_scored_avg=(runs / gp) if gp else 0.0,
+            runs_allowed_avg=(runs_allowed / gp) if gp else 0.0,
+            hits_avg=(hits / gp) if gp else 0.0,
+            home_runs=_to_float(hitting.get("homeRuns")),
+            strikeouts=_to_float(hitting.get("strikeOuts")),
+            walks=_to_float(hitting.get("baseOnBalls")),
+            obp=_to_float(hitting.get("obp")),
+            slg=_to_float(hitting.get("slg")),
+            ops=_to_float(hitting.get("ops")),
+            era=_to_float(pitching.get("era")),
+            whip=_to_float(pitching.get("whip")),
+            k_per_nine=_to_float(pitching.get("strikeoutsPer9Inn")),
+            bb_per_nine=_to_float(pitching.get("walksPer9Inn")),
+            wins=_to_int(standing.get("wins")),
+            losses=_to_int(standing.get("losses")),
+            win_pct=_to_float(standing.get("win_pct"), 0.5),
+            streak=str(standing.get("streak") or ""),
+            last_10=str(standing.get("last_10") or ""),
+            home_wins=_to_int(standing.get("home_wins")),
+            home_losses=_to_int(standing.get("home_losses")),
+            away_wins=_to_int(standing.get("away_wins")),
+            away_losses=_to_int(standing.get("away_losses")),
+            run_differential=_to_int(standing.get("run_differential")),
+            games_played=gp,
+            last_updated=datetime.now().strftime("%Y-%m-%d %H:%M"),
         )
-        
-        recent_games = self.get_recent_games(team_id, days=14)
-        
-        if not recent_games:
-            ts.wins = 0
-            ts.losses = 0
-            ts.games_played = 0
-            ts.runs_scored_avg = 0
-            ts.runs_allowed_avg = 0
-        else:
-            home_wins = 0
-            home_losses = 0
-            away_wins = 0
-            away_losses = 0
-            total_runs_scored = 0
-            total_runs_allowed = 0
-            wins = 0
-            losses = 0
-            
-            for game in recent_games:
-                if game.get("home_team_id") == team_id:
-                    scored = game.get("home_score", 0) or 0
-                    allowed = game.get("away_score", 0) or 0
-                    if scored > allowed:
-                        home_wins += 1
-                        wins += 1
-                    else:
-                        home_losses += 1
-                        losses += 1
-                else:
-                    scored = game.get("away_score", 0) or 0
-                    allowed = game.get("home_score", 0) or 0
-                    if scored > allowed:
-                        away_wins += 1
-                        wins += 1
-                    else:
-                        away_losses += 1
-                        losses += 1
-                
-                total_runs_scored += scored
-                total_runs_allowed += allowed
-            
-            games_count = len(recent_games)
-            ts.games_played = games_count
-            ts.wins = wins
-            ts.losses = losses
-            ts.home_wins = home_wins
-            ts.home_losses = home_losses
-            ts.away_wins = away_wins
-            ts.away_losses = away_losses
-            ts.runs_scored_avg = total_runs_scored / games_count if games_count > 0 else 0
-            ts.runs_allowed_avg = total_runs_allowed / games_count if games_count > 0 else 0
-            ts.win_pct = wins / games_count if games_count > 0 else 0.5
-            ts.run_differential = total_runs_scored - total_runs_allowed
-        
         ts.home_record = f"{ts.home_wins}-{ts.home_losses}"
         ts.away_record = f"{ts.away_wins}-{ts.away_losses}"
-        ts.last_10 = f"{ts.wins}-{ts.losses}"
-        
-        ts.era = 4.50
-        ts.whip = 1.35
-        ts.ops = 0.750
-        ts.obp = 0.320
-        ts.slg = 0.430
-        
-        ts.last_updated = datetime.now().strftime("%Y-%m-%d %H:%M")
-        
+        ts.recent_form = ts.last_10
+        ts.bullpen_era = ts.era
+
         if self.cache_stats is None:
             self.cache_stats = {}
         self.cache_stats[team_id] = ts
-        
         return ts
     
     def get_all_team_stats(self) -> Dict[int, TeamStats]:
-        print("  📊 Calculando estadísticas de equipos...")
-        
-        print("  ⬇️  Descargando partidos recientes...")
-        all_recent_games = []
-        end_date = datetime.now()
-        for i in range(30):
-            date_str = (end_date - timedelta(days=i)).strftime("%Y-%m-%d")
-            day_games = self.get_games_for_date(date_str)
-            for g in day_games:
-                if g.get("status") == "F":
-                    all_recent_games.append(g)
-        
-        print(f"  ✅ {len(all_recent_games)} partidos encontrados")
-        
+        print("  📊 Descargando estadísticas de temporada (MLB Stats API)...")
+        self._ensure_season_tables()
         stats = {}
-        for abbr, team_id in TEAM_IDS.items():
-            print(f"  📈 Calculando stats de {abbr.upper()}...")
+        for _abbr, team_id in TEAM_IDS.items():
             ts = self.get_team_stats(team_id)
             if ts:
                 stats[team_id] = ts
-        
         self.cache_stats = stats
         save_stats_to_csv(stats)
-        
+        print(f"  ✅ Stats de {len(stats)} equipos guardadas")
         return stats
     
     def get_recent_games(self, team_id: int, days: int = 10) -> List[Dict]:
         end_date = datetime.now()
         start_date = end_date - timedelta(days=days)
-        
-        games = []
-        current = start_date
-        while current <= end_date:
-            date_str = current.strftime("%Y-%m-%d")
-            day_games = self.get_games_for_date(date_str)
-            for g in day_games:
-                if g.get("home_team_id") == team_id or g.get("away_team_id") == team_id:
-                    if g.get("status") == "F":
-                        games.append(g)
-            current += timedelta(days=1)
-        
-        return games
+        games = self.api.schedule(
+            start_date=start_date.strftime("%Y-%m-%d"),
+            end_date=end_date.strftime("%Y-%m-%d"),
+            team_id=team_id,
+        )
+        return [g for g in games if g.get("status") == "F"]
+
+    def get_pitcher_stats(self, person_id: Optional[int]) -> Dict:
+        if not person_id:
+            return {}
+        pid = int(person_id)
+        if pid in self._pitcher_cache:
+            return self._pitcher_cache[pid]
+        stats = self.api.pitcher_season_stats(pid, self.season)
+        self._pitcher_cache[pid] = stats
+        return stats
     
-    def get_head_to_head(self, home_id: int, away_id: int) -> Tuple[int, int, int, List[str]]:
-        recent = self.get_recent_games(home_id, days=30)
-        
+    def get_head_to_head(
+        self,
+        home_id: int,
+        away_id: int,
+        as_of: Optional[str] = None,
+    ) -> Tuple[int, int, int, List[str]]:
+        """H2H desde el CSV local (2010+). as_of = YYYY-MM-DD para no usar el futuro."""
         h2h_home_wins = 0
         h2h_away_wins = 0
         total = 0
-        results = []
-        
-        for game in recent:
-            if game.get("status") != "F":
+        results: List[str] = []
+
+        def _tid(value) -> Optional[int]:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+
+        local = load_games_from_csv()
+        rows = local if local else self.get_recent_games(home_id, days=30)
+
+        for game in rows:
+            if str(game.get("status") or "") != "F":
                 continue
-            
-            if game.get("home_team_id") == home_id and game.get("away_team_id") == away_id:
-                total += 1
-                home_score = game.get("home_score", 0)
-                away_score = game.get("away_score", 0)
-                
-                if home_score > away_score:
+            ds = str(game.get("date") or "")
+            if as_of and ds and ds >= as_of:
+                continue
+            hid = _tid(game.get("home_team_id"))
+            aid = _tid(game.get("away_team_id"))
+            if {hid, aid} != {home_id, away_id}:
+                continue
+            try:
+                home_score = int(float(game.get("home_score") or 0))
+                away_score = int(float(game.get("away_score") or 0))
+            except (TypeError, ValueError):
+                continue
+            total += 1
+            home_side_won = home_score > away_score
+            if hid == home_id:
+                if home_side_won:
                     h2h_home_wins += 1
                     results.append("W")
                 else:
                     h2h_away_wins += 1
                     results.append("L")
-        
+            else:
+                if home_side_won:
+                    h2h_away_wins += 1
+                    results.append("L")
+                else:
+                    h2h_home_wins += 1
+                    results.append("W")
+
         return h2h_home_wins, h2h_away_wins, total, results[:5]
     
-    def predict_game(self, home_team_id: int, away_team_id: int) -> Dict:
+    def predict_game(
+        self,
+        home_team_id: int,
+        away_team_id: int,
+        game: Optional[Dict] = None,
+    ) -> Dict:
         home_stats = self.get_team_stats(home_team_id)
         away_stats = self.get_team_stats(away_team_id)
         
         if not home_stats or not away_stats:
             return {"predicted_winner": "N/A", "confidence": 0}
+
+        game = game or {}
+        home_p = self.get_pitcher_stats(game.get("home_pitcher_id"))
+        away_p = self.get_pitcher_stats(game.get("away_pitcher_id"))
+        home_p_name = game.get("home_pitcher_name") or ""
+        away_p_name = game.get("away_pitcher_name") or ""
         
         home_score = 50
         away_score = 50
@@ -519,8 +583,23 @@ class MLBPredictor:
         
         if home_stats.run_differential > 0 and away_stats.run_differential < 0:
             home_score += 5
+
+        home_l30 = _to_float(((self._hitting_l30 or {}).get(home_team_id) or {}).get("ops"))
+        away_l30 = _to_float(((self._hitting_l30 or {}).get(away_team_id) or {}).get("ops"))
+        if home_l30 and away_l30:
+            home_score += (home_l30 - away_l30) * 25
+
+        if home_p.get("ip", 0) >= 10 and away_p.get("ip", 0) >= 10:
+            era_gap = away_p["era"] - home_p["era"]
+            whip_gap = away_p["whip"] - home_p["whip"]
+            home_score += era_gap * 7
+            home_score += whip_gap * 10
         
-        h2h_home, h2h_away, h2h_total, h2h_results = self.get_head_to_head(home_team_id, away_team_id)
+        h2h_home, h2h_away, h2h_total, h2h_results = self.get_head_to_head(
+            home_team_id,
+            away_team_id,
+            as_of=game.get("date"),
+        )
         if h2h_total > 0:
             h2h_pct = h2h_home / h2h_total
             home_score += (h2h_pct - 0.5) * 20
@@ -576,6 +655,20 @@ class MLBPredictor:
                 f"{winner_abbr} domina el diferencial de carreras: {winner_stats.run_differential:+.0f} vs "
                 f"{loser_stats.run_differential:+.0f} ⭐⭐"
             )
+
+        winner_p = home_p if home_prob > away_prob else away_p
+        loser_p = away_p if home_prob > away_prob else home_p
+        winner_p_name = home_p_name if home_prob > away_prob else away_p_name
+        loser_p_name = away_p_name if home_prob > away_prob else home_p_name
+        if winner_p.get("ip", 0) >= 10 and loser_p.get("ip", 0) >= 10 and winner_p["era"] + 0.25 < loser_p["era"]:
+            factors_for_winner.append(
+                f"Abridor {winner_p_name or winner_abbr}: ERA {winner_p['era']:.2f}, WHIP {winner_p['whip']:.2f} "
+                f"vs {loser_p_name or loser_abbr} ERA {loser_p['era']:.2f} ⭐⭐⭐"
+            )
+        elif loser_p.get("ip", 0) >= 10 and winner_p.get("ip", 0) >= 10 and loser_p["era"] + 0.25 < winner_p["era"]:
+            factors_for_loser.append(
+                f"Mejor abridor del lado de {loser_abbr}: {loser_p_name} ERA {loser_p['era']:.2f} ⭐⭐"
+            )
         
         if loser_stats.runs_scored_avg > 4.5:
             factors_for_loser.append(
@@ -603,7 +696,13 @@ class MLBPredictor:
             "factors_for_winner": factors_for_winner[:4],
             "factors_for_loser": factors_for_loser[:4],
             "winner_abbr": winner_abbr,
-            "loser_abbr": loser_abbr
+            "loser_abbr": loser_abbr,
+            "home_pitcher_name": home_p_name,
+            "away_pitcher_name": away_p_name,
+            "home_pitcher_era": home_p.get("era"),
+            "away_pitcher_era": away_p.get("era"),
+            "home_pitcher_whip": home_p.get("whip"),
+            "away_pitcher_whip": away_p.get("whip"),
         }
     
     def format_prediction(self, game: Dict, prediction: Dict, details: Dict = None) -> str:
@@ -627,6 +726,16 @@ class MLBPredictor:
         output.append("─" * 80)
         output.append(f"⚾️ PARTIDO: {away_abbr} @ {home_abbr}")
         output.append(f"📅 {time_str}")
+        away_pn = prediction.get("away_pitcher_name") or game.get("away_pitcher_name") or ""
+        home_pn = prediction.get("home_pitcher_name") or game.get("home_pitcher_name") or ""
+        if away_pn or home_pn:
+            away_era = prediction.get("away_pitcher_era")
+            home_era = prediction.get("home_pitcher_era")
+            away_era_s = f" ERA {away_era:.2f}" if away_era else ""
+            home_era_s = f" ERA {home_era:.2f}" if home_era else ""
+            output.append(
+                f"🧢 Abridores: {away_pn or 'TBD'}{away_era_s}  vs  {home_pn or 'TBD'}{home_era_s}"
+            )
         if is_final:
             away_score = game.get("away_score", "")
             home_score = game.get("home_score", "")
@@ -752,7 +861,8 @@ def run_predictions_for_date(model: MLBPredictor, date_to_use: str, save_csv: bo
     for game in games:
         pred = model.predict_game(
             home_team_id=game["home_team_id"],
-            away_team_id=game["away_team_id"]
+            away_team_id=game["away_team_id"],
+            game=game,
         )
         pred["game_time"] = game.get("time", "")
         
@@ -775,6 +885,8 @@ def run_predictions_for_date(model: MLBPredictor, date_to_use: str, save_csv: bo
                 "predicted_winner", "predicted_abbr", "confidence",
                 "away_prob", "home_prob",
                 "away_score", "home_score",
+                "away_pitcher", "home_pitcher",
+                "away_pitcher_era", "home_pitcher_era",
                 "game_time", "venue",
             ]
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
@@ -794,6 +906,10 @@ def run_predictions_for_date(model: MLBPredictor, date_to_use: str, save_csv: bo
                     "home_prob": round(pred.get("home_prob", 0), 2),
                     "away_score": game.get("away_score", ""),
                     "home_score": game.get("home_score", ""),
+                    "away_pitcher": pred.get("away_pitcher_name") or game.get("away_pitcher_name", ""),
+                    "home_pitcher": pred.get("home_pitcher_name") or game.get("home_pitcher_name", ""),
+                    "away_pitcher_era": pred.get("away_pitcher_era") or "",
+                    "home_pitcher_era": pred.get("home_pitcher_era") or "",
                     "game_time": pred.get("game_time", ""),
                     "venue": game.get("venue", ""),
                 })
@@ -828,60 +944,133 @@ def show_menu():
     print("  5 — 📄 Exportar CSV de hoy")
     print("  6 — 📄 Exportar CSV de ayer")
     print()
+    print("  A — ⬇️  Descargar historial (2010 → hoy)")
+    print()
     print("  0 — 🚪 Salir")
     print()
     print("=" * 60)
 
 
-def main():
+def cmd_menu(_args: argparse.Namespace | None = None) -> int:
     while True:
         show_menu()
-        choice = input("Elige una opción: ").strip()
-        
+        choice = input("Elige una opción: ").strip().upper()
+
         if choice == "1":
             date_to_use = datetime.now().strftime("%Y-%m-%d")
             model = MLBPredictor()
             run_predictions_for_date(model, date_to_use)
             input("\n⏎ Presiona ENTER para continuar...")
-            
+
         elif choice == "2":
             date_to_use = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
             model = MLBPredictor()
             run_predictions_for_date(model, date_to_use)
             input("\n⏎ Presiona ENTER para continuar...")
-            
+
         elif choice == "3":
             date_to_use = get_date_input()
             model = MLBPredictor()
             run_predictions_for_date(model, date_to_use)
             input("\n⏎ Presiona ENTER para continuar...")
-            
+
         elif choice == "4":
             sync_daily()
             input("\n⏎ Presiona ENTER para continuar...")
-            
+
         elif choice == "5":
             date_to_use = datetime.now().strftime("%Y-%m-%d")
             model = MLBPredictor()
             print(f"\n📄 Exportando CSV para {date_to_use}...")
             run_predictions_for_date(model, date_to_use, save_csv=True)
             input("\n⏎ Presiona ENTER para continuar...")
-            
+
         elif choice == "6":
             date_to_use = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
             model = MLBPredictor()
             print(f"\n📄 Exportando CSV para {date_to_use}...")
             run_predictions_for_date(model, date_to_use, save_csv=True)
             input("\n⏎ Presiona ENTER para continuar...")
-            
+
+        elif choice == "A":
+            download_history(2010)
+            input("\n⏎ Presiona ENTER para continuar...")
+
         elif choice == "0":
             print("\n🚪 ¡Hasta luego!")
             break
-            
+
         else:
             print("\n❌ Opción inválida. Intenta de nuevo.")
             input("\n⏎ Presiona ENTER para continuar...")
+    return 0
+
+
+def cmd_download(args: argparse.Namespace) -> int:
+    from_year = getattr(args, "from_year", None)
+    if from_year:
+        return download_history(int(from_year), getattr(args, "to_year", None))
+    sync_daily()
+    return 0
+
+
+def cmd_predict(args: argparse.Namespace) -> int:
+    date_to_use = getattr(args, "date", None) or datetime.now().strftime("%Y-%m-%d")
+    try:
+        datetime.strptime(date_to_use, "%Y-%m-%d")
+    except ValueError:
+        print("❌ Formato inválido. Usa --date YYYY-MM-DD")
+        return 1
+    model = MLBPredictor()
+    run_predictions_for_date(model, date_to_use)
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="MLB Predict — calendario y menú")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    d = sub.add_parser(
+        "download",
+        help="Sincronizar ayer, o bajar historial 2010+ con --from-year",
+    )
+    d.add_argument(
+        "--from-year",
+        type=int,
+        default=None,
+        help="Bajar temporadas desde este año (mínimo recomendado: 2010)",
+    )
+    d.add_argument(
+        "--to-year",
+        type=int,
+        default=None,
+        help="Hasta este año (por defecto el año actual)",
+    )
+    d.set_defaults(func=cmd_download)
+
+    pr = sub.add_parser("predict", help="Predecir partidos del calendario (fecha dada)")
+    pr.add_argument(
+        "--date",
+        type=str,
+        default=None,
+        help="YYYY-MM-DD (por defecto hoy en local)",
+    )
+    pr.set_defaults(func=cmd_predict)
+
+    sub.add_parser("menu", help="Menú interactivo con todas las opciones").set_defaults(
+        func=cmd_menu
+    )
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if not argv:
+        return cmd_menu()
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return int(args.func(args) or 0)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

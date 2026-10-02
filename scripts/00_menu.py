@@ -1,24 +1,19 @@
 #!/usr/bin/env python3
-"""
-Entrypoint simple para abrir el menu principal del predictor MLB.
+"""Menú interactivo principal para MLB Predict."""
 
-Uso:
-    python3 scripts/00_menu.py
-"""
+from __future__ import annotations
 
 import sys
-from pathlib import Path
+
+from _project_root import chdir_to_project_root
 
 
-def main() -> None:
-    root_dir = Path(__file__).resolve().parent.parent
-    if str(root_dir) not in sys.path:
-        sys.path.insert(0, str(root_dir))
+def main() -> int:
+    chdir_to_project_root()
+    from mlb_prediction_model import main as cli_main
 
-    from mlb_prediction_model import main as mlb_menu_main
-
-    mlb_menu_main()
+    return cli_main(["menu", *sys.argv[1:]])
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
