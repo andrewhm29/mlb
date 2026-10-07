@@ -82,7 +82,13 @@ GAMES_CSV_FIELDS = [
     "game_pk", "date", "season", "game_type", "status",
     "away_team_id", "away_team_name", "away_team_abbr", "away_score",
     "home_team_id", "home_team_name", "home_team_abbr", "home_score",
+    "away_pitcher_id", "away_pitcher_name",
+    "home_pitcher_id", "home_pitcher_name",
     "venue", "game_time",
+]
+PITCHER_STATS_CSV = DATA_DIR / "pitcher_seasons.csv"
+PITCHER_STATS_FIELDS = [
+    "season", "player_id", "name", "era", "whip", "ip", "games_started",
 ]
 
 
@@ -149,6 +155,10 @@ def save_game_to_csv(game: Dict):
                 game.get("home_team_name", ""),
                 game.get("home_team_abbr", ""),
                 game.get("home_score", ""),
+                game.get("away_pitcher_id", ""),
+                game.get("away_pitcher_name", ""),
+                game.get("home_pitcher_id", ""),
+                game.get("home_pitcher_name", ""),
                 game.get("venue", ""),
                 game.get("game_time") or game.get("time", ""),
             ])
@@ -167,22 +177,27 @@ def save_games_history(games: List[Dict], merge: bool = True) -> int:
         pk = str(game.get("game_pk") or "")
         if not pk:
             continue
+        prev = by_pk.get(pk) or {}
         by_pk[pk] = {
             "game_pk": pk,
-            "date": game.get("date", ""),
-            "season": game.get("season", ""),
-            "game_type": game.get("game_type", ""),
-            "status": game.get("status", ""),
-            "away_team_id": game.get("away_team_id", ""),
-            "away_team_name": game.get("away_team_name", ""),
-            "away_team_abbr": game.get("away_team_abbr", ""),
-            "away_score": game.get("away_score", ""),
-            "home_team_id": game.get("home_team_id", ""),
-            "home_team_name": game.get("home_team_name", ""),
-            "home_team_abbr": game.get("home_team_abbr", ""),
-            "home_score": game.get("home_score", ""),
-            "venue": game.get("venue", ""),
-            "game_time": game.get("game_time") or game.get("time", ""),
+            "date": game.get("date", "") or prev.get("date", ""),
+            "season": game.get("season", "") or prev.get("season", ""),
+            "game_type": game.get("game_type", "") or prev.get("game_type", ""),
+            "status": game.get("status", "") or prev.get("status", ""),
+            "away_team_id": game.get("away_team_id", "") or prev.get("away_team_id", ""),
+            "away_team_name": game.get("away_team_name", "") or prev.get("away_team_name", ""),
+            "away_team_abbr": game.get("away_team_abbr", "") or prev.get("away_team_abbr", ""),
+            "away_score": game.get("away_score", "") if game.get("away_score") not in (None, "") else prev.get("away_score", ""),
+            "home_team_id": game.get("home_team_id", "") or prev.get("home_team_id", ""),
+            "home_team_name": game.get("home_team_name", "") or prev.get("home_team_name", ""),
+            "home_team_abbr": game.get("home_team_abbr", "") or prev.get("home_team_abbr", ""),
+            "home_score": game.get("home_score", "") if game.get("home_score") not in (None, "") else prev.get("home_score", ""),
+            "away_pitcher_id": game.get("away_pitcher_id") or prev.get("away_pitcher_id", ""),
+            "away_pitcher_name": game.get("away_pitcher_name") or prev.get("away_pitcher_name", ""),
+            "home_pitcher_id": game.get("home_pitcher_id") or prev.get("home_pitcher_id", ""),
+            "home_pitcher_name": game.get("home_pitcher_name") or prev.get("home_pitcher_name", ""),
+            "venue": game.get("venue", "") or prev.get("venue", ""),
+            "game_time": game.get("game_time") or game.get("time") or prev.get("game_time", ""),
         }
     rows = sorted(by_pk.values(), key=lambda r: (str(r.get("date") or ""), str(r.get("game_pk") or "")))
     with open(GAMES_CSV, "w", newline="", encoding="utf-8") as f:
@@ -211,7 +226,26 @@ def download_history(from_year: int = 2010, to_year: Optional[int] = None) -> in
         all_final.extend(finals)
         time.sleep(0.35)
     total = save_games_history(all_final, merge=True)
+    with_sp = sum(
+        1
+        for g in all_final
+        if g.get("home_pitcher_id") and g.get("away_pitcher_id")
+    )
     print(f"\n✅ Guardado: {total} partidos en {GAMES_CSV}")
+    print(f"   Abridores en esta descarga: {with_sp}/{len(all_final)}")
+
+    print("\n📥 ERA de abridores por temporada (para el modelo as-of)...")
+    ensure_data_dir()
+    pitcher_rows: List[Dict] = []
+    for year in range(from_year - 1, to_year + 1):
+        print(f"  ⬇️  Starters {year}...", flush=True)
+        pitcher_rows.extend(client.season_starters(year))
+        time.sleep(0.25)
+    with open(PITCHER_STATS_CSV, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=PITCHER_STATS_FIELDS)
+        writer.writeheader()
+        writer.writerows(pitcher_rows)
+    print(f"✅ {len(pitcher_rows)} filas pitcher → {PITCHER_STATS_CSV}")
     return 0
 
 
@@ -302,6 +336,10 @@ class MLBPredictor:
         self._hitting_l30: Optional[Dict[int, Dict]] = None
         self._standings: Optional[Dict[int, Dict]] = None
         self._pitcher_cache: Dict[int, Dict] = {}
+        self._ml_bundle = None
+        self._ml_tried = False
+        self._ml_snap = None
+        self._ml_as_of = None
 
     def _get(self, endpoint: str, params: dict = None) -> dict:
         return self.api.get(endpoint, params)
@@ -607,6 +645,43 @@ class MLBPredictor:
         total = home_score + away_score
         home_prob = home_score / total if total > 0 else 0.5
         away_prob = away_score / total if total > 0 else 0.5
+
+        try:
+            from mlb_ml import load_bundle, snapshot_before, matchup_features, p_home_win
+
+            if not self._ml_tried:
+                self._ml_tried = True
+                self._ml_bundle = load_bundle()
+            if self._ml_bundle:
+                as_of = str(game.get("date") or datetime.now().strftime("%Y-%m-%d"))
+                if self._ml_as_of != as_of:
+                    self._ml_snap = snapshot_before(as_of)
+                    self._ml_as_of = as_of
+                hera = home_p.get("era") if home_p.get("ip", 0) >= 10 else None
+                aera = away_p.get("era") if away_p.get("ip", 0) >= 10 else None
+                hid_p = game.get("home_pitcher_id")
+                aid_p = game.get("away_pitcher_id")
+                try:
+                    hid_p = int(hid_p) if hid_p else None
+                    aid_p = int(aid_p) if aid_p else None
+                except (TypeError, ValueError):
+                    hid_p, aid_p = None, None
+                feats = matchup_features(
+                    self._ml_snap,
+                    int(home_team_id),
+                    int(away_team_id),
+                    as_of,
+                    str(game.get("venue") or ""),
+                    str(game.get("game_type") or "R"),
+                    home_pitcher_id=hid_p,
+                    away_pitcher_id=aid_p,
+                    live_home_era=hera,
+                    live_away_era=aera,
+                )
+                home_prob = p_home_win(self._ml_bundle, feats)
+                away_prob = 1.0 - home_prob
+        except Exception as exc:
+            print(f"  ⚠️  Modelo ML no usado: {exc}")
         
         prob_diff = abs(home_prob - away_prob)
         # Escala de confianza tipo app: siempre entre 50% y 95%.
@@ -945,6 +1020,7 @@ def show_menu():
     print("  6 — 📄 Exportar CSV de ayer")
     print()
     print("  A — ⬇️  Descargar historial (2010 → hoy)")
+    print("  T — 🏋️  Entrenar modelo (as-of, holdout 2026)")
     print()
     print("  0 — 🚪 Salir")
     print()
@@ -996,6 +1072,10 @@ def cmd_menu(_args: argparse.Namespace | None = None) -> int:
             download_history(2010)
             input("\n⏎ Presiona ENTER para continuar...")
 
+        elif choice == "T":
+            cmd_train(argparse.Namespace(holdout=str(datetime.now().year)))
+            input("\n⏎ Presiona ENTER para continuar...")
+
         elif choice == "0":
             print("\n🚪 ¡Hasta luego!")
             break
@@ -1011,6 +1091,16 @@ def cmd_download(args: argparse.Namespace) -> int:
     if from_year:
         return download_history(int(from_year), getattr(args, "to_year", None))
     sync_daily()
+    return 0
+
+
+def cmd_train(args: argparse.Namespace) -> int:
+    from mlb_ml import train_and_save, print_metrics
+
+    hold = str(getattr(args, "holdout", None) or datetime.now().year)
+    print(f"\n🏋️  Entrenando (holdout temporada {hold})...")
+    bundle = train_and_save(holdout_season=hold)
+    print_metrics(bundle)
     return 0
 
 
@@ -1056,6 +1146,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="YYYY-MM-DD (por defecto hoy en local)",
     )
     pr.set_defaults(func=cmd_predict)
+
+    tr = sub.add_parser("train", help="Entrenar logística as-of y evaluar holdout")
+    tr.add_argument(
+        "--holdout",
+        type=str,
+        default=None,
+        help="Temporada de test (por defecto el año actual)",
+    )
+    tr.set_defaults(func=cmd_train)
 
     sub.add_parser("menu", help="Menú interactivo con todas las opciones").set_defaults(
         func=cmd_menu

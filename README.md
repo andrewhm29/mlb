@@ -26,7 +26,8 @@ Igual que en NHL: un script de calendario **sin menú**. Ejecútalo desde la ra�
 
 ```bash
 pip install -r requirements.txt   # solo la primera vez (o si cambian dependencias)
-python3 scripts/01_download.py --from-year 2010    # historial 2010 → hoy
+python3 scripts/01_download.py --from-year 2010    # historial + abridores + ERA por temporada
+python3 scripts/04_train.py                       # entrena (as-of, con pitcher) y mide 2026
 python3 scripts/05_predict.py
 python3 scripts/05_predict.py
 ```
@@ -58,6 +59,7 @@ python3 scripts/00_menu.py
 | **5** | Misma lógica que **1**, mostrando mensaje de exportación; enfocado en CSV de hoy. |
 | **6** | Misma lógica que **2**, para CSV de ayer. |
 | **A** | Descarga historial **2010 → hoy** a `data/games_history.csv`. |
+| **T** | Entrena el modelo (features sin futuro; holdout = temporada actual). |
 | **0** | Salir. |
 
 Tras cada acción el programa puede pedir que pulses **Enter** para volver al menú.

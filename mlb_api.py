@@ -172,10 +172,11 @@ class MlbStatsClient:
         return parse_schedule_games(self.get("schedule", params))
 
     def schedule_season(self, season: int) -> list[dict]:
-        """Temporada regular + playoffs de un año (la API tiene historial desde ~1901; usamos 2010+)."""
+        """Temporada regular + playoffs de un año, con abridor anunciado si la API lo trae."""
+        hydrate = "probablePitcher,team,venue"
         games = self.schedule(
             season=season,
-            hydrate="team,venue",
+            hydrate=hydrate,
             game_types="R,F,D,L,W",
         )
         if games:
@@ -183,9 +184,52 @@ class MlbStatsClient:
         return self.schedule(
             start_date=f"{season}-03-01",
             end_date=f"{season}-11-30",
-            hydrate="team,venue",
+            hydrate=hydrate,
             game_types="R,F,D,L,W",
         )
+
+    def season_starters(self, season: int) -> list[dict]:
+        """ERA de temporada de pitchers con al menos un juego iniciado."""
+        out: list[dict] = []
+        offset = 0
+        while offset < 5000:
+            data = self.get(
+                "stats",
+                {
+                    "stats": "season",
+                    "group": "pitching",
+                    "season": season,
+                    "sportIds": 1,
+                    "playerPool": "all",
+                    "limit": 1000,
+                    "offset": offset,
+                },
+            )
+            splits = (data.get("stats") or [{}])[0].get("splits") or []
+            if not splits:
+                break
+            for split in splits:
+                player = split.get("player") or {}
+                pid = player.get("id")
+                stat = split.get("stat") or {}
+                gs = _to_int(stat.get("gamesStarted"))
+                if pid is None or gs < 1:
+                    continue
+                out.append(
+                    {
+                        "season": season,
+                        "player_id": int(pid),
+                        "name": player.get("fullName") or "",
+                        "era": _to_float(stat.get("era"), 4.5),
+                        "whip": _to_float(stat.get("whip"), 1.3),
+                        "ip": _to_float(stat.get("inningsPitched")),
+                        "games_started": gs,
+                    }
+                )
+            if len(splits) < 1000:
+                break
+            offset += 1000
+        return out
 
     def boxscore(self, game_pk: int) -> dict:
         return self.get(f"game/{game_pk}/boxscore")
