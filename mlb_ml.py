@@ -17,6 +17,7 @@ ROLL = 20
 ELO_HOME = 30.0
 ELO_K = 20.0
 LEAGUE_ERA = 4.20
+DEFAULT_OU_LINE = 8.5
 FEATURE_COLS = [
     "elo_diff",
     "rest_home",
@@ -43,6 +44,20 @@ FEATURE_COLS = [
     "sp_known_away",
     "sp_roll_ra_home",
     "sp_roll_ra_away",
+]
+TOTALS_COLS = [
+    "exp_total",
+    "park_rpg",
+    "roll_rs_home",
+    "roll_rs_away",
+    "roll_ra_home",
+    "roll_ra_away",
+    "sp_era_home",
+    "sp_era_away",
+    "sp_roll_ra_home",
+    "sp_roll_ra_away",
+    "sp_known_home",
+    "sp_known_away",
 ]
 
 
@@ -248,16 +263,19 @@ def features_from_state(
     sp: dict[str, float] | None = None,
 ) -> dict[str, float]:
     extra = sp or {}
+    rs_h, ra_h = home.avg("rs"), home.avg("ra")
+    rs_a, ra_a = away.avg("rs"), away.avg("ra")
     return {
         "elo_diff": home.elo - away.elo,
         "rest_home": home.rest_days(date),
         "rest_away": away.rest_days(date),
         "roll_wp_home": home.wp(),
         "roll_wp_away": away.wp(),
-        "roll_rs_home": home.avg("rs"),
-        "roll_rs_away": away.avg("rs"),
-        "roll_ra_home": home.avg("ra"),
-        "roll_ra_away": away.avg("ra"),
+        "roll_rs_home": rs_h,
+        "roll_rs_away": rs_a,
+        "roll_ra_home": ra_h,
+        "roll_ra_away": ra_a,
+        "exp_total": 0.5 * (rs_h + ra_a) + 0.5 * (rs_a + ra_h),
         "season_wp_home": home.season_wp(),
         "season_wp_away": away.season_wp(),
         "season_rd_pg_home": home.season_rd_pg(),
@@ -475,8 +493,37 @@ def matchup_features(
     )
 
 
-def _matrix(rows: list[dict]) -> np.ndarray:
-    return np.array([[float(r[c]) for c in FEATURE_COLS] for r in rows], dtype="float64")
+def _matrix(rows: list[dict], cols: list[str] | None = None) -> np.ndarray:
+    use = cols or FEATURE_COLS
+    return np.array([[float(r.get(c, 0.0)) for c in use] for r in rows], dtype="float64")
+
+
+def _exp_sides(feats: dict[str, float]) -> tuple[float, float]:
+    home_r = 0.5 * float(feats.get("roll_rs_home") or 4.5) + 0.5 * float(feats.get("roll_ra_away") or 4.5)
+    away_r = 0.5 * float(feats.get("roll_rs_away") or 4.5) + 0.5 * float(feats.get("roll_ra_home") or 4.5)
+    return home_r, away_r
+
+
+def _sp_run_adj(feats: dict[str, float], side: str) -> float:
+    known = float(feats.get(f"sp_known_{side}") or 0.0)
+    era = float(feats.get(f"sp_era_{side}") or LEAGUE_ERA)
+    roll = float(feats.get(f"sp_roll_ra_{side}") or 4.5)
+    era_s = (0.5 * era + 0.5 * LEAGUE_ERA) if known else LEAGUE_ERA
+    roll_s = 0.35 * roll + 0.65 * 4.5
+    return 0.32 * (era_s - LEAGUE_ERA) + 0.20 * (roll_s - 4.5)
+
+
+def structural_total(feats: dict[str, float], league_total: float = 8.83) -> dict[str, float]:
+    """Carreras esperadas por lado: ataque vs pitcheo rival + abridor contrario + parque."""
+    home_r, away_r = _exp_sides(feats)
+    park_each = 0.20 * (float(feats.get("park_rpg") or league_total) - league_total)
+    # El abridor local enfrenta a la ofensiva visitante (y al revés).
+    home_r = home_r + _sp_run_adj(feats, "away") + park_each
+    away_r = away_r + _sp_run_adj(feats, "home") + park_each
+    home_r = float(np.clip(home_r, 2.2, 8.0))
+    away_r = float(np.clip(away_r, 2.2, 8.0))
+    total = float(np.clip(home_r + away_r, 6.0, 13.0))
+    return {"home_runs": home_r, "away_runs": away_r, "total": total}
 
 
 def train_and_save(
@@ -531,22 +578,39 @@ def train_and_save(
     y_total = np.array([m["total"] for m in meta], dtype="float64")
     y_home_r = np.array([m["home_score"] for m in meta], dtype="float64")
     y_away_r = np.array([m["away_score"] for m in meta], dtype="float64")
-    ridge_total = Ridge(alpha=4.0)
-    ridge_home = Ridge(alpha=4.0)
-    ridge_away = Ridge(alpha=4.0)
-    ridge_total.fit(X_train, y_total[train_idx], sample_weight=weights)
-    ridge_home.fit(X_train, y_home_r[train_idx], sample_weight=weights)
-    ridge_away.fit(X_train, y_away_r[train_idx], sample_weight=weights)
-    train_resid = y_total[train_idx] - ridge_total.predict(X_train)
-    resid_std = float(np.std(train_resid)) or 2.8
+    league_rpg = float(y_total[train_idx].mean()) if train_idx else 8.83
+    Xt = _matrix(X_rows, TOTALS_COLS)
+    tot_scaler = StandardScaler()
+    Xt_train = tot_scaler.fit_transform(Xt[train_idx])
+    ridge_total = Ridge(alpha=2.0)
+    ridge_home = Ridge(alpha=2.0)
+    ridge_away = Ridge(alpha=2.0)
+    ridge_total.fit(Xt_train, y_total[train_idx], sample_weight=weights)
+    ridge_home.fit(Xt_train, y_home_r[train_idx], sample_weight=weights)
+    ridge_away.fit(Xt_train, y_away_r[train_idx], sample_weight=weights)
+    totals_blend = 0.28
+    struct_tr = np.array(
+        [structural_total(X_rows[i], league_rpg)["total"] for i in train_idx],
+        dtype="float64",
+    )
+    blend_tr = totals_blend * ridge_total.predict(Xt_train) + (1.0 - totals_blend) * struct_tr
+    resid_std = float(np.std(y_total[train_idx] - blend_tr)) or 2.8
+    ou_sigma = float(np.clip(0.70 * resid_std, 2.55, 3.20))
+
+    def _blend_pred(idx: list[int]) -> np.ndarray:
+        ridge_hat = ridge_total.predict(tot_scaler.transform(Xt[idx]))
+        struct_hat = np.array(
+            [structural_total(X_rows[i], league_rpg)["total"] for i in idx],
+            dtype="float64",
+        )
+        return totals_blend * ridge_hat + (1.0 - totals_blend) * struct_hat
 
     def _totals_metrics(idx: list[int]) -> dict[str, float]:
         if not idx:
             return {}
-        Xt = scaler.transform(X[idx])
-        pred_t = ridge_total.predict(Xt)
+        pred_t = _blend_pred(idx)
         yt = y_total[idx]
-        line = np.full_like(pred_t, 8.5)
+        line = np.full_like(pred_t, DEFAULT_OU_LINE)
         ou_hat = (pred_t > line).astype(int)
         ou_true = (yt > line).astype(int)
         return {
@@ -554,6 +618,8 @@ def train_and_save(
             "mae_total": float(mean_absolute_error(yt, pred_t)),
             "mean_pred": float(pred_t.mean()),
             "mean_real": float(yt.mean()),
+            "pred_std": float(pred_t.std()),
+            "pct_over_8_5": float((pred_t > line).mean()),
             "ou_acc_8_5": float((ou_hat == ou_true).mean()),
         }
 
@@ -567,7 +633,12 @@ def train_and_save(
         "ridge_total": ridge_total,
         "ridge_home": ridge_home,
         "ridge_away": ridge_away,
+        "totals_scaler": tot_scaler,
+        "totals_cols": TOTALS_COLS,
+        "totals_blend": totals_blend,
+        "league_rpg": league_rpg,
         "resid_std": resid_std,
+        "ou_sigma": ou_sigma,
         "totals_train": _totals_metrics(train_idx),
         "totals_holdout": _totals_metrics(test_idx),
     }
@@ -618,21 +689,24 @@ def _phi(z: float) -> float:
 
 
 def predict_totals(bundle: dict[str, Any], feats: dict[str, float]) -> dict[str, float]:
-    cols = bundle["feature_cols"]
-    x = np.array([[float(feats.get(c, 0.0)) for c in cols]], dtype="float64")
-    xs = bundle["scaler"].transform(x)
-    total = float(bundle["ridge_total"].predict(xs)[0])
-    home_r = float(bundle["ridge_home"].predict(xs)[0])
-    away_r = float(bundle["ridge_away"].predict(xs)[0])
-    if home_r < 0.5:
-        home_r = 0.5
-    if away_r < 0.5:
-        away_r = 0.5
-    split = home_r + away_r
-    if split > 0:
-        home_r *= total / split
-        away_r *= total / split
-    sigma = float(bundle.get("resid_std") or 2.8)
+    league = float(bundle.get("league_rpg") or 8.83)
+    struct = structural_total(feats, league)
+    total = struct["total"]
+    cols = bundle.get("totals_cols")
+    scaler = bundle.get("totals_scaler")
+    ridge = bundle.get("ridge_total")
+    if cols and scaler is not None and ridge is not None:
+        x = np.array([[float(feats.get(c, 0.0)) for c in cols]], dtype="float64")
+        xs = scaler.transform(x)
+        ridge_t = float(ridge.predict(xs)[0])
+        w = float(bundle.get("totals_blend", 0.28))
+        total = w * ridge_t + (1.0 - w) * struct["total"]
+    total = float(np.clip(total, 6.0, 13.0))
+    split = max(struct["home_runs"] + struct["away_runs"], 0.1)
+    home_r = total * (struct["home_runs"] / split)
+    away_r = total - home_r
+    sigma = float(bundle.get("ou_sigma") or bundle.get("resid_std") or 2.8)
+    sigma = float(np.clip(sigma, 2.55, 3.20))
     return {
         "home_runs": home_r,
         "away_runs": away_r,
@@ -641,19 +715,93 @@ def predict_totals(bundle: dict[str, Any], feats: dict[str, float]) -> dict[str,
     }
 
 
-def over_under(pred_total: float, line: float, sigma: float = 2.8) -> dict[str, Any]:
-    z = (line - pred_total) / max(sigma, 0.6)
+def projected_score(home_exp: float, away_exp: float, p_home: float) -> tuple[int, int]:
+    """Marcador entero coherente con favorito y carreras esperadas (nunca empate)."""
+    home_exp = max(0.8, float(home_exp))
+    away_exp = max(0.8, float(away_exp))
+    home_i = max(1, int(round(home_exp)))
+    away_i = max(1, int(round(away_exp)))
+    fav_home = float(p_home) >= 0.5
+    if fav_home:
+        if home_i < away_i:
+            if away_i > 1:
+                home_i += 1
+                away_i -= 1
+            if home_i <= away_i:
+                home_i = away_i + 1
+        elif home_i == away_i:
+            home_i += 1
+    else:
+        if away_i < home_i:
+            if home_i > 1:
+                away_i += 1
+                home_i -= 1
+            if away_i <= home_i:
+                away_i = home_i + 1
+        elif away_i == home_i:
+            away_i += 1
+    return int(home_i), int(away_i)
+
+
+def ou_factor_rows(
+    feats: dict[str, float],
+    totals: dict[str, float],
+    line: float,
+    league: float | None = None,
+) -> list[str]:
+    home_r, away_r = _exp_sides(feats)
+    park = float(feats.get("park_rpg") or 0)
+    lg = float(league) if league else 8.83
+    rows = [
+        f"Forma reciente: local ~{home_r:.1f} R esperadas, visitante ~{away_r:.1f} R "
+        f"(RS/RA últimos {ROLL} juegos)",
+        f"Parque: {park:.1f} R/juego de ambiente (no se usa como línea)",
+    ]
+    eh = float(feats.get("sp_era_home") or LEAGUE_ERA)
+    ea = float(feats.get("sp_era_away") or LEAGUE_ERA)
+    if feats.get("sp_known_home") or feats.get("sp_known_away"):
+        rows.append(f"Abridores (ERA, encogida hacia la liga): {eh:.2f} vs {ea:.2f}")
+    tot = float(totals["total"])
+    decide = ou_decide_at(line, lg)
+    if decide > line + 0.05:
+        rows.append(
+            f"Línea {line:g} está bajo la media MLB ({lg:.1f}); "
+            f"OVER solo si el total ({tot:.1f}) supera un juego típico"
+        )
+    rows.append(f"Total del modelo {tot:.1f} vs línea {line:g} ({tot - line:+.1f})")
+    return rows
+
+
+def ou_decide_at(line: float, league: float | None = None) -> float:
+    """Si la línea está bajo la media de liga (~8.9), 8.5 sale OVER en casi todo.
+
+    El lado se decide contra max(línea, media): un juego típico queda 50/50, no OVER.
+    """
+    lg = float(league) if league and league > 0 else 8.83
+    return float(max(line, lg))
+
+
+def over_under(
+    pred_total: float,
+    line: float,
+    sigma: float = 2.8,
+    league: float | None = None,
+) -> dict[str, Any]:
+    decide = ou_decide_at(line, league)
+    z = (decide - pred_total) / max(sigma, 0.6)
     p_over = 1.0 - _phi(z)
     p_over = float(np.clip(p_over, 0.05, 0.95))
     pick = "OVER" if p_over >= 0.5 else "UNDER"
     p_pick = p_over if pick == "OVER" else 1.0 - p_over
     return {
         "line": float(line),
+        "decide_at": decide,
         "pick": pick,
         "p_over": p_over,
         "p_under": 1.0 - p_over,
         "p_pick": p_pick,
         "diff": pred_total - line,
+        "edge_vs_typical": pred_total - decide,
     }
 
 
@@ -752,6 +900,8 @@ def print_metrics(bundle: dict[str, Any]) -> None:
         print(
             f"  Totales {hold}: MAE={tt.get('mae_total', 0):.2f} carreras  "
             f"media pred {tt.get('mean_pred', 0):.1f} vs real {tt.get('mean_real', 0):.1f}  "
-            f"O/U vs línea 8.5: {tt.get('ou_acc_8_5', 0):.3f}"
+            f"O/U vs línea 8.5: {tt.get('ou_acc_8_5', 0):.3f}  "
+            f"std pred {tt.get('pred_std', 0):.2f}  "
+            f"%OVER {100 * tt.get('pct_over_8_5', 0):.0f}"
         )
     print(f"  Archivo: {bundle.get('path', MODEL_PATH)}\n")

@@ -340,6 +340,8 @@ class MLBPredictor:
         self._ml_tried = False
         self._ml_snap = None
         self._ml_as_of = None
+        self._last_totals = None
+        self.ou_line = None
 
     def _get(self, endpoint: str, params: dict = None) -> dict:
         return self.api.get(endpoint, params)
@@ -590,6 +592,7 @@ class MLBPredictor:
             return {"predicted_winner": "N/A", "confidence": 0}
 
         game = game or {}
+        self._last_totals = None
         home_p = self.get_pitcher_stats(game.get("home_pitcher_id"))
         away_p = self.get_pitcher_stats(game.get("away_pitcher_id"))
         home_p_name = game.get("home_pitcher_name") or ""
@@ -681,15 +684,29 @@ class MLBPredictor:
                 home_prob = p_home_win(self._ml_bundle, feats)
                 away_prob = 1.0 - home_prob
                 if self._ml_bundle.get("ridge_total") is not None:
-                    from mlb_ml import predict_totals, over_under, round_line, team_context, win_factor_rows
+                    from mlb_ml import (
+                        DEFAULT_OU_LINE,
+                        predict_totals,
+                        over_under,
+                        projected_score,
+                        team_context,
+                        win_factor_rows,
+                        ou_factor_rows,
+                    )
 
                     totals = predict_totals(self._ml_bundle, feats)
                     line = game.get("ou_line")
                     if line is None:
                         line = getattr(self, "ou_line", None)
                     if line is None:
-                        line = round_line(float(feats.get("park_rpg") or totals["total"]))
-                    ou = over_under(totals["total"], float(line), totals["sigma"])
+                        line = DEFAULT_OU_LINE
+                    league = float(self._ml_bundle.get("league_rpg") or 8.83)
+                    ou = over_under(
+                        totals["total"],
+                        float(line),
+                        totals["sigma"],
+                        league=league,
+                    )
                     ha = self.get_team_abbreviation(home_team_id)
                     aa = self.get_team_abbreviation(away_team_id)
                     home_fac, away_fac = win_factor_rows(
@@ -698,11 +715,17 @@ class MLBPredictor:
                     game["_ml_home_fac"] = home_fac
                     game["_ml_away_fac"] = away_fac
                     # stash on self via return dict below using locals
+                    score_h, score_a = projected_score(
+                        totals["home_runs"], totals["away_runs"], home_prob
+                    )
                     self._last_totals = {
                         "home_runs": totals["home_runs"],
                         "away_runs": totals["away_runs"],
                         "total": totals["total"],
+                        "score_home": score_h,
+                        "score_away": score_a,
                         "ou": ou,
+                        "ou_fac": ou_factor_rows(feats, totals, float(line), league),
                         "home_ctx": team_context(self._ml_snap, int(home_team_id)),
                         "away_ctx": team_context(self._ml_snap, int(away_team_id)),
                         "home_fac": home_fac,
@@ -815,11 +838,15 @@ class MLBPredictor:
                     "pred_home_runs": extra["home_runs"],
                     "pred_away_runs": extra["away_runs"],
                     "pred_total": extra["total"],
+                    "score_home": extra.get("score_home"),
+                    "score_away": extra.get("score_away"),
                     "ou_line": extra["ou"]["line"],
                     "ou_pick": extra["ou"]["pick"],
                     "ou_p_over": extra["ou"]["p_over"] * 100,
                     "ou_p_under": extra["ou"]["p_under"] * 100,
                     "ou_diff": extra["ou"]["diff"],
+                    "ou_edge": extra["ou"].get("edge_vs_typical", 0),
+                    "ou_fac": extra.get("ou_fac") or [],
                     "home_ctx": extra["home_ctx"],
                     "away_ctx": extra["away_ctx"],
                     "ml_home_fac": extra["home_fac"],
@@ -856,6 +883,10 @@ class MLBPredictor:
         out.append(line)
         out.append("")
         out.append(f"🎯 EL MODELO DICE: {pred_abbr} GANA")
+        sh = prediction.get("score_home")
+        sa = prediction.get("score_away")
+        if sh is not None and sa is not None:
+            out.append(f"   MARCADOR: {away_abbr} {int(sa)} - {int(sh)} {home_abbr}")
         out.append(f"   Confianza: {prediction.get('confidence', 0):.0f}%")
         out.append(f"   {away_abbr}: {away_prob:.0f}% chance  |  {home_abbr}: {home_prob:.0f}% chance")
         out.append("")
@@ -928,29 +959,19 @@ class MLBPredictor:
             p_over = float(prediction.get("ou_p_over") or 50)
             p_under = float(prediction.get("ou_p_under") or 50)
             diff = float(prediction.get("ou_diff") or 0)
-            out.append("🎯 PREDICCIÓN DE CARRERAS:")
-            out.append(f"   {home_abbr}: {hr:.1f} carreras")
-            out.append(f"   {away_abbr}: {ar:.1f} carreras")
-            out.append(f"   Total: {float(pred_total):.1f} carreras")
+            sh = prediction.get("score_home")
+            sa = prediction.get("score_away")
+            if sh is not None and sa is not None:
+                out.append(f"🎯 MARCADOR: {away_abbr} {int(sa)} - {int(sh)} {home_abbr}")
+            out.append(f"   Esperado (promedio): {away_abbr} {ar:.1f}  @  {home_abbr} {hr:.1f}  ·  total {float(pred_total):.1f}")
             out.append("")
             side_p = p_over if pick == "OVER" else p_under
             out.append(f"🧾 O/U {ou_line:g}: {pick}  ({pick.lower()} prob: {side_p:.0f}%)")
-            hrs = float(hctx.get("rs") or 4.5)
-            hra = float(hctx.get("ra") or 4.5)
-            ars = float(actx.get("rs") or 4.5)
-            ara = float(actx.get("ra") or 4.5)
-            side_home = 0.5 * hrs + 0.5 * ara
-            side_away = 0.5 * ars + 0.5 * hra
-            out.append(
-                f"   → Ofensiva local {home_abbr} ({hrs:.1f}) vs Defensa visitante {away_abbr} ({ara:.1f}) "
-                f"[últimos 5 juegos] → ~{side_home:.1f} R esperadas de ese lado"
-            )
-            out.append(
-                f"   → Ofensiva visitante {away_abbr} ({ars:.1f}) vs Defensa local {home_abbr} ({hra:.1f}) "
-                f"[últimos 5 juegos] → ~{side_away:.1f} R esperadas de ese lado"
-            )
-            vs = "por encima" if diff > 0 else "por debajo"
-            out.append(f"   → Total predicho {float(pred_total):.1f} {vs} de la línea ({diff:+.1f})")
+            for i, row in enumerate(prediction.get("ou_fac") or [], start=1):
+                out.append(f"   {i}. {row}")
+            if not prediction.get("ou_fac"):
+                vs = "por encima" if diff > 0 else "por debajo"
+                out.append(f"   → Total predicho {float(pred_total):.1f} {vs} de la línea ({diff:+.1f})")
             out.append("")
             away_p01 = away_prob / 100.0
             out.append(
@@ -1068,6 +1089,7 @@ def run_predictions_for_date(
                 "away_pitcher", "home_pitcher",
                 "away_pitcher_era", "home_pitcher_era",
                 "pred_away_runs", "pred_home_runs", "pred_total",
+                "pred_score_away", "pred_score_home",
                 "ou_line", "ou_pick", "ou_p_over",
                 "game_time", "venue",
             ]
@@ -1095,6 +1117,8 @@ def run_predictions_for_date(
                     "pred_away_runs": round(pred.get("pred_away_runs") or 0, 2) if pred.get("pred_total") is not None else "",
                     "pred_home_runs": round(pred.get("pred_home_runs") or 0, 2) if pred.get("pred_total") is not None else "",
                     "pred_total": round(pred.get("pred_total") or 0, 2) if pred.get("pred_total") is not None else "",
+                    "pred_score_away": pred.get("score_away", ""),
+                    "pred_score_home": pred.get("score_home", ""),
                     "ou_line": pred.get("ou_line", ""),
                     "ou_pick": pred.get("ou_pick", ""),
                     "ou_p_over": round(pred.get("ou_p_over") or 0, 2) if pred.get("ou_p_over") is not None else "",
@@ -1263,7 +1287,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--ou-line",
         type=float,
         default=None,
-        help="Línea de over/under (carreras). Por defecto: total típico del parque (.5)",
+        help="Línea de over/under (carreras). Por defecto: 8.5 para todos los partidos",
     )
     pr.set_defaults(func=cmd_predict)
 
