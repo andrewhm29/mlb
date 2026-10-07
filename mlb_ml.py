@@ -100,6 +100,45 @@ class TeamForm:
         n = self.w + self.l
         return (self.rs - self.ra) / n if n else 0.0
 
+    def last_n(self, n: int = 5, bucket: deque | None = None) -> list:
+        g = list(bucket if bucket is not None else self.games)
+        return g[-n:]
+
+    def last_n_wp(self, n: int = 5, bucket: deque | None = None) -> float:
+        g = self.last_n(n, bucket)
+        if not g:
+            return 0.5
+        return sum(x["win"] for x in g) / len(g)
+
+    def last_n_avg(self, key: str, n: int = 5, bucket: deque | None = None) -> float:
+        g = self.last_n(n, bucket)
+        if not g:
+            return 4.5
+        return sum(x[key] for x in g) / len(g)
+
+    def context(self, n: int = 5) -> dict[str, float]:
+        g = self.last_n(n)
+        hg = self.last_n(n, self.home_games)
+        ag = self.last_n(n, self.away_games)
+        return {
+            "n": float(len(g)),
+            "wp": self.last_n_wp(n),
+            "rs": self.last_n_avg("rs", n),
+            "ra": self.last_n_avg("ra", n),
+            "wins": float(sum(x["win"] for x in g)),
+            "home_n": float(len(hg)),
+            "home_wins": float(sum(x["win"] for x in hg)),
+            "home_rs": sum(x["rs"] for x in hg) / len(hg) if hg else 4.5,
+            "home_ra": sum(x["ra"] for x in hg) / len(hg) if hg else 4.5,
+            "away_n": float(len(ag)),
+            "away_wins": float(sum(x["win"] for x in ag)),
+            "away_rs": sum(x["rs"] for x in ag) / len(ag) if ag else 4.5,
+            "away_ra": sum(x["ra"] for x in ag) / len(ag) if ag else 4.5,
+            "season_wp": self.season_wp(),
+            "season_w": float(self.w),
+            "season_l": float(self.l),
+        }
+
 
 def _tid(value: Any) -> int | None:
     try:
@@ -342,6 +381,9 @@ def build_dataset(games: list[dict] | None = None) -> tuple[list[dict], list[int
                 "away_id": aid,
                 "home_win": g["home_win"],
                 "venue": g["venue"],
+                "home_score": g["home_score"],
+                "away_score": g["away_score"],
+                "total": g["home_score"] + g["away_score"],
             }
         )
         _apply_result(home, away, g)
@@ -441,9 +483,9 @@ def train_and_save(
     holdout_season: str = "2026",
     path: Path | None = None,
 ) -> dict[str, Any]:
-    from sklearn.linear_model import LogisticRegression
+    from sklearn.linear_model import LogisticRegression, Ridge
     from sklearn.preprocessing import StandardScaler
-    from sklearn.metrics import accuracy_score, brier_score_loss, log_loss
+    from sklearn.metrics import accuracy_score, brier_score_loss, log_loss, mean_absolute_error
     import joblib
 
     X_rows, y, meta = build_dataset()
@@ -486,6 +528,35 @@ def train_and_save(
             "log_loss": float(log_loss(yt, np.clip(p, 1e-6, 1 - 1e-6))),
         }
 
+    y_total = np.array([m["total"] for m in meta], dtype="float64")
+    y_home_r = np.array([m["home_score"] for m in meta], dtype="float64")
+    y_away_r = np.array([m["away_score"] for m in meta], dtype="float64")
+    ridge_total = Ridge(alpha=4.0)
+    ridge_home = Ridge(alpha=4.0)
+    ridge_away = Ridge(alpha=4.0)
+    ridge_total.fit(X_train, y_total[train_idx], sample_weight=weights)
+    ridge_home.fit(X_train, y_home_r[train_idx], sample_weight=weights)
+    ridge_away.fit(X_train, y_away_r[train_idx], sample_weight=weights)
+    train_resid = y_total[train_idx] - ridge_total.predict(X_train)
+    resid_std = float(np.std(train_resid)) or 2.8
+
+    def _totals_metrics(idx: list[int]) -> dict[str, float]:
+        if not idx:
+            return {}
+        Xt = scaler.transform(X[idx])
+        pred_t = ridge_total.predict(Xt)
+        yt = y_total[idx]
+        line = np.full_like(pred_t, 8.5)
+        ou_hat = (pred_t > line).astype(int)
+        ou_true = (yt > line).astype(int)
+        return {
+            "n": float(len(idx)),
+            "mae_total": float(mean_absolute_error(yt, pred_t)),
+            "mean_pred": float(pred_t.mean()),
+            "mean_real": float(yt.mean()),
+            "ou_acc_8_5": float((ou_hat == ou_true).mean()),
+        }
+
     bundle = {
         "model": model,
         "scaler": scaler,
@@ -493,6 +564,12 @@ def train_and_save(
         "holdout_season": holdout_season,
         "train_metrics": _metrics(train_idx),
         "holdout_metrics": _metrics(test_idx),
+        "ridge_total": ridge_total,
+        "ridge_home": ridge_home,
+        "ridge_away": ridge_away,
+        "resid_std": resid_std,
+        "totals_train": _totals_metrics(train_idx),
+        "totals_holdout": _totals_metrics(test_idx),
     }
     out = path or MODEL_PATH
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -534,6 +611,127 @@ def p_home_win(
     return float(np.clip(p, 0.05, 0.95))
 
 
+def _phi(z: float) -> float:
+    from math import erf, sqrt
+
+    return 0.5 * (1.0 + erf(z / sqrt(2.0)))
+
+
+def predict_totals(bundle: dict[str, Any], feats: dict[str, float]) -> dict[str, float]:
+    cols = bundle["feature_cols"]
+    x = np.array([[float(feats.get(c, 0.0)) for c in cols]], dtype="float64")
+    xs = bundle["scaler"].transform(x)
+    total = float(bundle["ridge_total"].predict(xs)[0])
+    home_r = float(bundle["ridge_home"].predict(xs)[0])
+    away_r = float(bundle["ridge_away"].predict(xs)[0])
+    if home_r < 0.5:
+        home_r = 0.5
+    if away_r < 0.5:
+        away_r = 0.5
+    split = home_r + away_r
+    if split > 0:
+        home_r *= total / split
+        away_r *= total / split
+    sigma = float(bundle.get("resid_std") or 2.8)
+    return {
+        "home_runs": home_r,
+        "away_runs": away_r,
+        "total": total,
+        "sigma": sigma,
+    }
+
+
+def over_under(pred_total: float, line: float, sigma: float = 2.8) -> dict[str, Any]:
+    z = (line - pred_total) / max(sigma, 0.6)
+    p_over = 1.0 - _phi(z)
+    p_over = float(np.clip(p_over, 0.05, 0.95))
+    pick = "OVER" if p_over >= 0.5 else "UNDER"
+    p_pick = p_over if pick == "OVER" else 1.0 - p_over
+    return {
+        "line": float(line),
+        "pick": pick,
+        "p_over": p_over,
+        "p_under": 1.0 - p_over,
+        "p_pick": p_pick,
+        "diff": pred_total - line,
+    }
+
+
+def round_line(value: float) -> float:
+    return round(value * 2.0) / 2.0
+
+
+def team_context(snap: dict[str, Any], team_id: int, n: int = 5) -> dict[str, float]:
+    team = (snap.get("teams") or {}).get(team_id) or TeamForm()
+    return team.context(n)
+
+
+def win_factor_rows(
+    bundle: dict[str, Any],
+    feats: dict[str, float],
+    home_abbr: str,
+    away_abbr: str,
+    p_home: float,
+) -> tuple[list[str], list[str]]:
+    """Factores del modelo (pp) + contexto. pp ≈ p*(1-p)*contribución al logit."""
+    cols = bundle["feature_cols"]
+    x = np.array([[float(feats.get(c, 0.0)) for c in cols]], dtype="float64")
+    xs = bundle["scaler"].transform(x)[0]
+    coef = bundle["model"].coef_[0]
+    scale = float(p_home * (1.0 - p_home) * 100.0)
+    labeled = []
+    texts = {
+        "elo_diff": ("Elo / nivel reciente", True),
+        "rest_home": (f"Descanso de {home_abbr}", True),
+        "rest_away": (f"Descanso de {away_abbr}", False),
+        "roll_wp_home": (f"Forma reciente de {home_abbr} (win%)", True),
+        "roll_wp_away": (f"Forma reciente de {away_abbr} (win%)", False),
+        "roll_rs_home": (f"Ataque de {home_abbr}: {feats.get('roll_rs_home', 0):.1f} R/juego", True),
+        "roll_rs_away": (f"Ataque de {away_abbr}: {feats.get('roll_rs_away', 0):.1f} R/juego", False),
+        "roll_ra_home": (f"Pitcheo de {home_abbr}: permite {feats.get('roll_ra_home', 0):.1f} R/juego", True),
+        "roll_ra_away": (f"Pitcheo de {away_abbr}: permite {feats.get('roll_ra_away', 0):.1f} R/juego", False),
+        "season_wp_home": (f"Récord de temporada {home_abbr}", True),
+        "season_wp_away": (f"Récord de temporada {away_abbr}", False),
+        "season_rd_pg_home": (f"Diferencial de carreras {home_abbr}", True),
+        "season_rd_pg_away": (f"Diferencial de carreras {away_abbr}", False),
+        "sp_known_home": (f"Abridor {home_abbr} identificado", True),
+        "sp_known_away": (f"Abridor {away_abbr} identificado", False),
+        "home_wp_at_home": (f"{home_abbr} en casa (forma local)", True),
+        "away_wp_on_road": (f"{away_abbr} de visitante", False),
+        "park_rpg": ("Parque (carreras esperadas de ambiente)", True),
+        "h2h_home_wp": ("Head-to-head histórico", True),
+        "sp_era_home": (f"Abridor {home_abbr} (ERA previa)", True),
+        "sp_era_away": (f"Abridor {away_abbr} (ERA previa)", False),
+        "sp_era_diff": ("Choque de abridores (ERA)", True),
+        "sp_roll_ra_home": (f"Abridor {home_abbr} en starts recientes", True),
+        "sp_roll_ra_away": (f"Abridor {away_abbr} en starts recientes", False),
+        "is_playoff": ("Contexto playoff", True),
+    }
+    for i, col in enumerate(cols):
+        pp = float(coef[i] * xs[i] * scale)
+        if abs(pp) < 0.35:
+            continue
+        label, home_positive = texts.get(col, (col, True))
+        favors_home = pp > 0
+        labeled.append((abs(pp), favors_home, pp, label))
+    labeled.sort(reverse=True)
+    home_rows: list[str] = []
+    away_rows: list[str] = []
+    n_h = n_a = 0
+    for _mag, favors_home, pp, label in labeled:
+        sign = f"[+{abs(pp):.1f} pp]"
+        line = f"{label}  {sign}"
+        if favors_home:
+            if n_h < 5:
+                home_rows.append(line)
+                n_h += 1
+        else:
+            if n_a < 5:
+                away_rows.append(line)
+                n_a += 1
+    return home_rows, away_rows
+
+
 def print_metrics(bundle: dict[str, Any]) -> None:
     def _line(title: str, m: dict[str, float]) -> None:
         if not m:
@@ -549,4 +747,11 @@ def print_metrics(bundle: dict[str, Any]) -> None:
     _line("Train  (< holdout)", bundle.get("train_metrics") or {})
     hold = bundle.get("holdout_season", "")
     _line(f"Holdout ({hold})", bundle.get("holdout_metrics") or {})
+    tt = bundle.get("totals_holdout") or {}
+    if tt:
+        print(
+            f"  Totales {hold}: MAE={tt.get('mae_total', 0):.2f} carreras  "
+            f"media pred {tt.get('mean_pred', 0):.1f} vs real {tt.get('mean_real', 0):.1f}  "
+            f"O/U vs línea 8.5: {tt.get('ou_acc_8_5', 0):.3f}"
+        )
     print(f"  Archivo: {bundle.get('path', MODEL_PATH)}\n")

@@ -680,6 +680,35 @@ class MLBPredictor:
                 )
                 home_prob = p_home_win(self._ml_bundle, feats)
                 away_prob = 1.0 - home_prob
+                if self._ml_bundle.get("ridge_total") is not None:
+                    from mlb_ml import predict_totals, over_under, round_line, team_context, win_factor_rows
+
+                    totals = predict_totals(self._ml_bundle, feats)
+                    line = game.get("ou_line")
+                    if line is None:
+                        line = getattr(self, "ou_line", None)
+                    if line is None:
+                        line = round_line(float(feats.get("park_rpg") or totals["total"]))
+                    ou = over_under(totals["total"], float(line), totals["sigma"])
+                    ha = self.get_team_abbreviation(home_team_id)
+                    aa = self.get_team_abbreviation(away_team_id)
+                    home_fac, away_fac = win_factor_rows(
+                        self._ml_bundle, feats, ha, aa, home_prob
+                    )
+                    game["_ml_home_fac"] = home_fac
+                    game["_ml_away_fac"] = away_fac
+                    # stash on self via return dict below using locals
+                    self._last_totals = {
+                        "home_runs": totals["home_runs"],
+                        "away_runs": totals["away_runs"],
+                        "total": totals["total"],
+                        "ou": ou,
+                        "home_ctx": team_context(self._ml_snap, int(home_team_id)),
+                        "away_ctx": team_context(self._ml_snap, int(away_team_id)),
+                        "home_fac": home_fac,
+                        "away_fac": away_fac,
+                        "feats": feats,
+                    }
         except Exception as exc:
             print(f"  ⚠️  Modelo ML no usado: {exc}")
         
@@ -758,7 +787,7 @@ class MLBPredictor:
         home_abbr = self.get_team_abbreviation(home_team_id)
         away_abbr = self.get_team_abbreviation(away_team_id)
         
-        return {
+        out = {
             "predicted_winner": predicted_winner,
             "predicted_abbr": predicted_abbr,
             "confidence": confidence,
@@ -779,94 +808,163 @@ class MLBPredictor:
             "home_pitcher_whip": home_p.get("whip"),
             "away_pitcher_whip": away_p.get("whip"),
         }
+        extra = getattr(self, "_last_totals", None)
+        if extra:
+            out.update(
+                {
+                    "pred_home_runs": extra["home_runs"],
+                    "pred_away_runs": extra["away_runs"],
+                    "pred_total": extra["total"],
+                    "ou_line": extra["ou"]["line"],
+                    "ou_pick": extra["ou"]["pick"],
+                    "ou_p_over": extra["ou"]["p_over"] * 100,
+                    "ou_p_under": extra["ou"]["p_under"] * 100,
+                    "ou_diff": extra["ou"]["diff"],
+                    "home_ctx": extra["home_ctx"],
+                    "away_ctx": extra["away_ctx"],
+                    "ml_home_fac": extra["home_fac"],
+                    "ml_away_fac": extra["away_fac"],
+                    "ml_feats": extra["feats"],
+                }
+            )
+            self._last_totals = None
+        return out
     
     def format_prediction(self, game: Dict, prediction: Dict, details: Dict = None) -> str:
         is_final = game.get("status") == "F"
-        
         away_abbr = prediction.get("away_abbr", "") or self.get_team_abbreviation(game.get("away_team_id", 0))
         home_abbr = prediction.get("home_abbr", "") or self.get_team_abbreviation(game.get("home_team_id", 0))
-        
-        game_time = game.get("time", "")
-        if game_time:
-            try:
-                dt = datetime.fromisoformat(game_time.replace("Z", "+00:00"))
-                time_str = dt.strftime("%-I:%M %p")
-            except:
-                time_str = "Por definir"
-        else:
-            time_str = "Por definir"
-        
-        output = []
-        
-        output.append("─" * 80)
-        output.append(f"⚾️ PARTIDO: {away_abbr} @ {home_abbr}")
-        output.append(f"📅 {time_str}")
+        pred_abbr = prediction.get("predicted_abbr", "")
+        winner = prediction.get("winner_abbr", pred_abbr)
+        loser = prediction.get("loser_abbr", "")
+        away_prob = float(prediction.get("away_prob", 0) or 0)
+        home_prob = float(prediction.get("home_prob", 0) or 0)
+        line = "─" * 80
+        out: List[str] = [line, f"⚾️  PARTIDO: {away_abbr} @ {home_abbr}"]
+        if is_final:
+            out.append(
+                f"🏁 FINAL: {away_abbr} {game.get('away_score', '')} - {game.get('home_score', '')} {home_abbr}"
+            )
         away_pn = prediction.get("away_pitcher_name") or game.get("away_pitcher_name") or ""
         home_pn = prediction.get("home_pitcher_name") or game.get("home_pitcher_name") or ""
         if away_pn or home_pn:
-            away_era = prediction.get("away_pitcher_era")
-            home_era = prediction.get("home_pitcher_era")
-            away_era_s = f" ERA {away_era:.2f}" if away_era else ""
-            home_era_s = f" ERA {home_era:.2f}" if home_era else ""
-            output.append(
-                f"🧢 Abridores: {away_pn or 'TBD'}{away_era_s}  vs  {home_pn or 'TBD'}{home_era_s}"
+            ae = prediction.get("away_pitcher_era")
+            he = prediction.get("home_pitcher_era")
+            ae_s = f" ERA {ae:.2f}" if ae else ""
+            he_s = f" ERA {he:.2f}" if he else ""
+            out.append(f"🧢 Abridores: {away_pn or 'TBD'}{ae_s}  vs  {home_pn or 'TBD'}{he_s}")
+        out.append(line)
+        out.append("")
+        out.append(f"🎯 EL MODELO DICE: {pred_abbr} GANA")
+        out.append(f"   Confianza: {prediction.get('confidence', 0):.0f}%")
+        out.append(f"   {away_abbr}: {away_prob:.0f}% chance  |  {home_abbr}: {home_prob:.0f}% chance")
+        out.append("")
+
+        def _block(title: str, rows: List[str], ctx: List[str]) -> None:
+            out.append(title)
+            out.append(line)
+            i = 1
+            for row in rows:
+                out.append(f"  {i}. {row}")
+                i += 1
+            for row in ctx:
+                out.append(f"  {i}. • {row}")
+                i += 1
+            if i == 1:
+                out.append("  Sin factores claros")
+            out.append("")
+
+        home_fac = list(prediction.get("ml_home_fac") or [])
+        away_fac = list(prediction.get("ml_away_fac") or [])
+        if not home_fac and not away_fac:
+            home_fac = list(prediction.get("factors_for_winner") or [])
+            away_fac = list(prediction.get("factors_for_loser") or [])
+        hctx = prediction.get("home_ctx") or {}
+        actx = prediction.get("away_ctx") or {}
+        ctx_home = []
+        ctx_away = []
+        if hctx.get("home_n", 0) >= 3:
+            ctx_home.append(
+                f"{home_abbr} en casa (últimos {int(hctx['home_n'])} como local): "
+                f"ganó {int(hctx['home_wins'])} de {int(hctx['home_n'])}, "
+                f"anota {hctx['home_rs']:.1f} y permite {hctx['home_ra']:.1f} R/juego"
             )
-        if is_final:
-            away_score = game.get("away_score", "")
-            home_score = game.get("home_score", "")
-            output.append(f"🏁 FINAL: {away_abbr} {away_score} - {home_score} {home_abbr}")
-        output.append("─" * 80)
-        output.append("")
-        
-        pred_abbr = prediction.get("predicted_abbr", "")
-        confidence = prediction.get("confidence", 0)
-        
-        output.append(f"🎯 EL MODELO DICE: {pred_abbr} GANA")
-        output.append(f"   Confianza: {confidence:.0f}%")
-        
-        away_prob = prediction.get("away_prob", 0)
-        home_prob = prediction.get("home_prob", 0)
-        output.append(f"   {away_abbr}: {away_prob:.0f}% chance | {home_abbr}: {home_prob:.0f}% chance")
-        
-        output.append("")
-        output.append("✅ ¿POR QUÉ FAVORECE A " + prediction.get("winner_abbr", pred_abbr) + "?")
-        output.append("─" * 80)
-        
-        factors_winner = prediction.get("factors_for_winner", [])
-        if factors_winner:
-            for factor in factors_winner:
-                output.append(f"  {factor}")
-        else:
-            output.append("  Sin factores claros")
-        
-        output.append("")
-        output.append("❌ ¿QUÉ FAVORECE A " + prediction.get("loser_abbr", "") + "?")
-        output.append("─" * 80)
-        
-        factors_loser = prediction.get("factors_for_loser", [])
-        if factors_loser:
-            for factor in factors_loser:
-                output.append(f"  {factor}")
-        else:
-            output.append("  Sin factores en contra")
-        
+        if actx.get("away_n", 0) >= 3:
+            ctx_away.append(
+                f"{away_abbr} de visitante (últimos {int(actx['away_n'])}): "
+                f"ganó {int(actx['away_wins'])} de {int(actx['away_n'])}, "
+                f"anota {actx['away_rs']:.1f} y permite {actx['away_ra']:.1f} R/juego"
+            )
+        if hctx and actx:
+            cross_h = f"{home_abbr} anota {hctx.get('rs', 0):.1f} R/juego y {away_abbr} permite {actx.get('ra', 0):.1f} (dif {hctx.get('rs', 0) - actx.get('ra', 0):+.1f})"
+            cross_a = f"{away_abbr} anota {actx.get('rs', 0):.1f} R/juego y {home_abbr} permite {hctx.get('ra', 0):.1f} (dif {actx.get('rs', 0) - hctx.get('ra', 0):+.1f})"
+            if winner == home_abbr:
+                ctx_home.append(cross_h)
+                ctx_away.append(cross_a)
+            else:
+                ctx_away.append(cross_a)
+                ctx_home.append(cross_h)
+
+        win_rows = home_fac if winner == home_abbr else away_fac
+        lose_rows = away_fac if winner == home_abbr else home_fac
+        win_ctx = ctx_home if winner == home_abbr else ctx_away
+        lose_ctx = ctx_away if winner == home_abbr else ctx_home
+        _block(f"✅ ¿POR QUÉ FAVORECE A {winner}?", win_rows[:5], win_ctx[:2])
+        _block(f"❌ ¿QUÉ FAVORECE A {loser}?", lose_rows[:5], lose_ctx[:2])
+        out.append("  [pp = puntos porcentuales de probabilidad que aporta el factor · • = dato de contexto, no del modelo]")
+        hw = int(hctx.get("season_w") or 0)
+        hl = int(hctx.get("season_l") or 0)
+        if hw + hl >= 10:
+            if hctx.get("season_wp", 0) >= 0.45 and actx.get("season_wp", 0) >= 0.45:
+                out.append("  ℹ️  Ambos equipos con récord de contender (≥45% de victorias)")
+        out.append("")
+
+        pred_total = prediction.get("pred_total")
+        if pred_total is not None:
+            hr = float(prediction.get("pred_home_runs") or 0)
+            ar = float(prediction.get("pred_away_runs") or 0)
+            ou_line = float(prediction.get("ou_line") or 8.5)
+            pick = prediction.get("ou_pick") or "UNDER"
+            p_over = float(prediction.get("ou_p_over") or 50)
+            p_under = float(prediction.get("ou_p_under") or 50)
+            diff = float(prediction.get("ou_diff") or 0)
+            out.append("🎯 PREDICCIÓN DE CARRERAS:")
+            out.append(f"   {home_abbr}: {hr:.1f} carreras")
+            out.append(f"   {away_abbr}: {ar:.1f} carreras")
+            out.append(f"   Total: {float(pred_total):.1f} carreras")
+            out.append("")
+            side_p = p_over if pick == "OVER" else p_under
+            out.append(f"🧾 O/U {ou_line:g}: {pick}  ({pick.lower()} prob: {side_p:.0f}%)")
+            hrs = float(hctx.get("rs") or 4.5)
+            hra = float(hctx.get("ra") or 4.5)
+            ars = float(actx.get("rs") or 4.5)
+            ara = float(actx.get("ra") or 4.5)
+            side_home = 0.5 * hrs + 0.5 * ara
+            side_away = 0.5 * ars + 0.5 * hra
+            out.append(
+                f"   → Ofensiva local {home_abbr} ({hrs:.1f}) vs Defensa visitante {away_abbr} ({ara:.1f}) "
+                f"[últimos 5 juegos] → ~{side_home:.1f} R esperadas de ese lado"
+            )
+            out.append(
+                f"   → Ofensiva visitante {away_abbr} ({ars:.1f}) vs Defensa local {home_abbr} ({hra:.1f}) "
+                f"[últimos 5 juegos] → ~{side_away:.1f} R esperadas de ese lado"
+            )
+            vs = "por encima" if diff > 0 else "por debajo"
+            out.append(f"   → Total predicho {float(pred_total):.1f} {vs} de la línea ({diff:+.1f})")
+            out.append("")
+            away_p01 = away_prob / 100.0
+            out.append(
+                f"DATA|{away_abbr}|{home_abbr}||{away_p01:.4f}|{float(pred_total):.1f}|{ou_line:g}|{pick}"
+            )
+
         if details and is_final:
-            output.append("")
-            output.append("─" * 80)
-            output.append("📊 RESULTADO FINAL")
-            output.append("─" * 80)
-            
+            out.append("")
             if details.get("winning_pitcher_name"):
-                wins = details.get("winning_pitcher_wins", 0)
-                output.append(f"🟢 GANA: {details['winning_pitcher_name']} ({wins}-0)")
-            
+                out.append(f"🟢 GANA: {details['winning_pitcher_name']}")
             if details.get("losing_pitcher_name"):
-                losses = details.get("losing_pitcher_losses", 0)
-                output.append(f"🔴 PIERDE: {details['losing_pitcher_name']} (0-{losses})")
-        
-        output.append("")
-        
-        return "\n".join(output)
+                out.append(f"🔴 PIERDE: {details['losing_pitcher_name']}")
+        out.append("")
+        return "\n".join(out)
 
 
 def sync_daily():
@@ -907,7 +1005,14 @@ def sync_daily():
     print("=" * 60)
 
 
-def run_predictions_for_date(model: MLBPredictor, date_to_use: str, save_csv: bool = True):
+def run_predictions_for_date(
+    model: MLBPredictor,
+    date_to_use: str,
+    save_csv: bool = True,
+    ou_line: float | None = None,
+):
+    if ou_line is not None:
+        model.ou_line = ou_line
     from pathlib import Path
     
     today = datetime.now().strftime("%Y-%m-%d")
@@ -962,6 +1067,8 @@ def run_predictions_for_date(model: MLBPredictor, date_to_use: str, save_csv: bo
                 "away_score", "home_score",
                 "away_pitcher", "home_pitcher",
                 "away_pitcher_era", "home_pitcher_era",
+                "pred_away_runs", "pred_home_runs", "pred_total",
+                "ou_line", "ou_pick", "ou_p_over",
                 "game_time", "venue",
             ]
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
@@ -985,6 +1092,12 @@ def run_predictions_for_date(model: MLBPredictor, date_to_use: str, save_csv: bo
                     "home_pitcher": pred.get("home_pitcher_name") or game.get("home_pitcher_name", ""),
                     "away_pitcher_era": pred.get("away_pitcher_era") or "",
                     "home_pitcher_era": pred.get("home_pitcher_era") or "",
+                    "pred_away_runs": round(pred.get("pred_away_runs") or 0, 2) if pred.get("pred_total") is not None else "",
+                    "pred_home_runs": round(pred.get("pred_home_runs") or 0, 2) if pred.get("pred_total") is not None else "",
+                    "pred_total": round(pred.get("pred_total") or 0, 2) if pred.get("pred_total") is not None else "",
+                    "ou_line": pred.get("ou_line", ""),
+                    "ou_pick": pred.get("ou_pick", ""),
+                    "ou_p_over": round(pred.get("ou_p_over") or 0, 2) if pred.get("ou_p_over") is not None else "",
                     "game_time": pred.get("game_time", ""),
                     "venue": game.get("venue", ""),
                 })
@@ -1112,7 +1225,8 @@ def cmd_predict(args: argparse.Namespace) -> int:
         print("❌ Formato inválido. Usa --date YYYY-MM-DD")
         return 1
     model = MLBPredictor()
-    run_predictions_for_date(model, date_to_use)
+    ou = getattr(args, "ou_line", None)
+    run_predictions_for_date(model, date_to_use, ou_line=ou)
     return 0
 
 
@@ -1144,6 +1258,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="YYYY-MM-DD (por defecto hoy en local)",
+    )
+    pr.add_argument(
+        "--ou-line",
+        type=float,
+        default=None,
+        help="Línea de over/under (carreras). Por defecto: total típico del parque (.5)",
     )
     pr.set_defaults(func=cmd_predict)
 

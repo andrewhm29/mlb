@@ -28,8 +28,7 @@ Igual que en NHL: un script de calendario **sin menú**. Ejecútalo desde la ra�
 pip install -r requirements.txt   # solo la primera vez (o si cambian dependencias)
 python3 scripts/01_download.py --from-year 2010    # historial + abridores + ERA por temporada
 python3 scripts/04_train.py                       # entrena (as-of, con pitcher) y mide 2026
-python3 scripts/05_predict.py
-python3 scripts/05_predict.py
+python3 scripts/05_predict.py --ou-line 8.5       # ganador + over/under de carreras
 ```
 
 Por defecto usa **hoy** (fecha local del sistema). Para otra fecha:
