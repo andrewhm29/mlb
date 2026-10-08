@@ -32,7 +32,7 @@ def parse_schedule_games(payload: dict) -> list[dict]:
     for date_entry in payload.get("dates") or []:
         for game in date_entry.get("games") or []:
             status = (game.get("status") or {}).get("statusCode", "")
-            if status not in ["S", "P", "PRE", "PW", "F", "I", "IR"]:
+            if status not in ["S", "P", "PRE", "PW", "F", "FT", "FR", "O", "I", "IR", "IW"]:
                 continue
             away = (game.get("teams") or {}).get("away") or {}
             home = (game.get("teams") or {}).get("home") or {}

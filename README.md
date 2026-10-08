@@ -28,11 +28,10 @@ Igual que en NHL: un script de calendario **sin menú**. Ejecútalo desde la ra�
 pip install -r requirements.txt   # solo la primera vez (o si cambian dependencias)
 python3 scripts/01_download.py --from-year 2010    # historial + abridores + ERA por temporada
 python3 scripts/04_train.py                       # entrena (as-of, con pitcher) y mide 2026
-python3 scripts/05_predict.py                     # ganador + O/U vs línea 8.5
-python3 scripts/05_predict.py --ou-line 9.0       # misma carta, otra línea de mercado
+python3 scripts/05_predict.py                     # ganador, marcador y O/U vs cuota de mercado
 ```
 
-La media MLB ronda **8.9 carreras**. Contra 8.5 un juego típico iría OVER; el lado OVER/UNDER se decide si el partido proyecta **más o menos que un juego normal**, no solo si supera 8.5.
+Cada partido usa su **línea ESPN/DraftKings** (hoy en playoffs ~6.5–7.5), no un 8.5 genérico. Calendario y abridores: MLB Stats API. Cuotas: ESPN, sin clave.
 
 Por defecto usa **hoy** (fecha local del sistema). Para otra fecha:
 

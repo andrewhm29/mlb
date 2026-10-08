@@ -17,7 +17,7 @@ ROLL = 20
 ELO_HOME = 30.0
 ELO_K = 20.0
 LEAGUE_ERA = 4.20
-DEFAULT_OU_LINE = 8.5
+DEFAULT_OU_LINE = 8.5  # solo métricas de train; el producto usa mercado ESPN
 FEATURE_COLS = [
     "elo_diff",
     "rest_home",
@@ -522,7 +522,10 @@ def structural_total(feats: dict[str, float], league_total: float = 8.83) -> dic
     away_r = away_r + _sp_run_adj(feats, "home") + park_each
     home_r = float(np.clip(home_r, 2.2, 8.0))
     away_r = float(np.clip(away_r, 2.2, 8.0))
-    total = float(np.clip(home_r + away_r, 6.0, 13.0))
+    if float(feats.get("is_playoff") or 0) >= 0.5:
+        home_r *= 0.88
+        away_r *= 0.88
+    total = float(np.clip(home_r + away_r, 5.5, 13.0))
     return {"home_runs": home_r, "away_runs": away_r, "total": total}
 
 
@@ -748,6 +751,7 @@ def ou_factor_rows(
     totals: dict[str, float],
     line: float,
     league: float | None = None,
+    market: bool = False,
 ) -> list[str]:
     home_r, away_r = _exp_sides(feats)
     park = float(feats.get("park_rpg") or 0)
@@ -762,23 +766,17 @@ def ou_factor_rows(
     if feats.get("sp_known_home") or feats.get("sp_known_away"):
         rows.append(f"Abridores (ERA, encogida hacia la liga): {eh:.2f} vs {ea:.2f}")
     tot = float(totals["total"])
-    decide = ou_decide_at(line, lg)
-    if decide > line + 0.05:
-        rows.append(
-            f"Línea {line:g} está bajo la media MLB ({lg:.1f}); "
-            f"OVER solo si el total ({tot:.1f}) supera un juego típico"
-        )
-    rows.append(f"Total del modelo {tot:.1f} vs línea {line:g} ({tot - line:+.1f})")
+    if market:
+        rows.append(f"Línea de mercado ESPN/DraftKings: {line:g}")
+    rows.append(f"Total del modelo {tot:.1f} vs esa línea ({tot - line:+.1f})")
     return rows
 
 
-def ou_decide_at(line: float, league: float | None = None) -> float:
-    """Si la línea está bajo la media de liga (~8.9), 8.5 sale OVER en casi todo.
-
-    El lado se decide contra max(línea, media): un juego típico queda 50/50, no OVER.
-    """
-    lg = float(league) if league and league > 0 else 8.83
-    return float(max(line, lg))
+def fallback_ou_line(feats: dict[str, float], league: float = 8.83) -> float:
+    """Si ESPN no trae cuota: 7.5 en playoffs, si no la media de liga a .5."""
+    if float(feats.get("is_playoff") or 0) >= 0.5:
+        return 7.5
+    return round_line(float(league or 8.83))
 
 
 def over_under(
@@ -786,22 +784,24 @@ def over_under(
     line: float,
     sigma: float = 2.8,
     league: float | None = None,
+    market: bool = False,
 ) -> dict[str, Any]:
-    decide = ou_decide_at(line, league)
-    z = (decide - pred_total) / max(sigma, 0.6)
+    """O/U contra la línea que se muestra (mercado). Sin sesgo extra a 8.5."""
+    z = (float(line) - pred_total) / max(sigma, 0.6)
     p_over = 1.0 - _phi(z)
     p_over = float(np.clip(p_over, 0.05, 0.95))
     pick = "OVER" if p_over >= 0.5 else "UNDER"
     p_pick = p_over if pick == "OVER" else 1.0 - p_over
     return {
         "line": float(line),
-        "decide_at": decide,
+        "decide_at": float(line),
         "pick": pick,
         "p_over": p_over,
         "p_under": 1.0 - p_over,
         "p_pick": p_pick,
-        "diff": pred_total - line,
-        "edge_vs_typical": pred_total - decide,
+        "diff": pred_total - float(line),
+        "edge_vs_typical": pred_total - float(line),
+        "market": bool(market),
     }
 
 

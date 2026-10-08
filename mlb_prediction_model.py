@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Tuple
 from pathlib import Path
 
+from espn_api import EspnMlbClient, merge_espn_into_games
 from mlb_api import MlbStatsClient, _to_float, _to_int
 
 DATA_DIR = Path(__file__).parent / "data"
@@ -327,6 +328,7 @@ def save_stats_to_csv(stats: Dict[int, TeamStats]):
 class MLBPredictor:
     def __init__(self, season: int = None):
         self.api = MlbStatsClient()
+        self.espn = EspnMlbClient()
         self.session = self.api.session
         self.today = datetime.now().strftime("%Y-%m-%d")
         self.season = season or datetime.now().year
@@ -379,6 +381,12 @@ class MLBPredictor:
                 game["home_team_abbr"] = self.get_team_abbreviation(int(hid))
             if not game.get("away_team_abbr") and aid:
                 game["away_team_abbr"] = self.get_team_abbreviation(int(aid))
+        try:
+            espn_rows = self.espn.scoreboard_around(date_str)
+            if espn_rows:
+                merge_espn_into_games(games, espn_rows)
+        except Exception as exc:
+            print(f"  ⚠️  No se pudieron cruzar líneas ESPN: {exc}")
         return games
     
     def get_game_live_details(self, game_pk: int) -> Dict:
@@ -685,27 +693,33 @@ class MLBPredictor:
                 away_prob = 1.0 - home_prob
                 if self._ml_bundle.get("ridge_total") is not None:
                     from mlb_ml import (
-                        DEFAULT_OU_LINE,
                         predict_totals,
                         over_under,
                         projected_score,
                         team_context,
                         win_factor_rows,
                         ou_factor_rows,
+                        fallback_ou_line,
                     )
 
                     totals = predict_totals(self._ml_bundle, feats)
-                    line = game.get("ou_line")
-                    if line is None:
-                        line = getattr(self, "ou_line", None)
-                    if line is None:
-                        line = DEFAULT_OU_LINE
                     league = float(self._ml_bundle.get("league_rpg") or 8.83)
+                    cli_line = getattr(self, "ou_line", None)
+                    if cli_line is not None:
+                        line = cli_line
+                        market = False
+                    elif game.get("ou_line") is not None:
+                        line = game.get("ou_line")
+                        market = True
+                    else:
+                        line = fallback_ou_line(feats, league)
+                        market = False
                     ou = over_under(
                         totals["total"],
                         float(line),
                         totals["sigma"],
                         league=league,
+                        market=market,
                     )
                     ha = self.get_team_abbreviation(home_team_id)
                     aa = self.get_team_abbreviation(away_team_id)
@@ -725,7 +739,14 @@ class MLBPredictor:
                         "score_home": score_h,
                         "score_away": score_a,
                         "ou": ou,
-                        "ou_fac": ou_factor_rows(feats, totals, float(line), league),
+                        "ou_fac": ou_factor_rows(
+                            feats, totals, float(line), league, market=market
+                        ),
+                        "ml_home": game.get("ml_home"),
+                        "ml_away": game.get("ml_away"),
+                        "odds_source": game.get("odds_source") or "",
+                        "odds_details": game.get("odds_details") or "",
+                        "ou_market": market,
                         "home_ctx": team_context(self._ml_snap, int(home_team_id)),
                         "away_ctx": team_context(self._ml_snap, int(away_team_id)),
                         "home_fac": home_fac,
@@ -847,6 +868,11 @@ class MLBPredictor:
                     "ou_diff": extra["ou"]["diff"],
                     "ou_edge": extra["ou"].get("edge_vs_typical", 0),
                     "ou_fac": extra.get("ou_fac") or [],
+                    "ml_home": extra.get("ml_home"),
+                    "ml_away": extra.get("ml_away"),
+                    "odds_source": extra.get("odds_source") or "",
+                    "odds_details": extra.get("odds_details") or "",
+                    "ou_market": extra.get("ou_market"),
                     "home_ctx": extra["home_ctx"],
                     "away_ctx": extra["away_ctx"],
                     "ml_home_fac": extra["home_fac"],
@@ -954,7 +980,7 @@ class MLBPredictor:
         if pred_total is not None:
             hr = float(prediction.get("pred_home_runs") or 0)
             ar = float(prediction.get("pred_away_runs") or 0)
-            ou_line = float(prediction.get("ou_line") or 8.5)
+            ou_line = float(prediction.get("ou_line") or 0)
             pick = prediction.get("ou_pick") or "UNDER"
             p_over = float(prediction.get("ou_p_over") or 50)
             p_under = float(prediction.get("ou_p_under") or 50)
@@ -966,7 +992,17 @@ class MLBPredictor:
             out.append(f"   Esperado (promedio): {away_abbr} {ar:.1f}  @  {home_abbr} {hr:.1f}  ·  total {float(pred_total):.1f}")
             out.append("")
             side_p = p_over if pick == "OVER" else p_under
-            out.append(f"🧾 O/U {ou_line:g}: {pick}  ({pick.lower()} prob: {side_p:.0f}%)")
+            src = "mercado ESPN" if prediction.get("ou_market") else "línea"
+            out.append(f"🧾 O/U {ou_line:g} ({src}): {pick}  ({pick.lower()} prob: {side_p:.0f}%)")
+            ml_h = prediction.get("ml_home")
+            ml_a = prediction.get("ml_away")
+            if ml_h is not None or ml_a is not None:
+                def _ml(v):
+                    if v is None:
+                        return "—"
+                    n = int(v)
+                    return f"+{n}" if n > 0 else str(n)
+                out.append(f"   Moneyline ESPN: {away_abbr} {_ml(ml_a)}  |  {home_abbr} {_ml(ml_h)}")
             for i, row in enumerate(prediction.get("ou_fac") or [], start=1):
                 out.append(f"   {i}. {row}")
             if not prediction.get("ou_fac"):
@@ -1050,6 +1086,11 @@ def run_predictions_for_date(
         return
     
     print(f"\n✅ Partidos detectados: {len(games)}")
+    n_mkt = sum(1 for g in games if g.get("ou_market") and g.get("ou_line") is not None)
+    if n_mkt:
+        print(f"📉 Líneas O/U y moneyline: mercado ESPN ({n_mkt}/{len(games)} partidos)")
+    else:
+        print("📉 Sin cuotas ESPN; O/U usa línea de playoffs (7.5) o media de liga, no 8.5 fijo")
     print("\n📥 Cargando modelo...")
     print(f"\n⏳ Calculando {len(games)} predicción(es)...")
     print()
@@ -1090,7 +1131,7 @@ def run_predictions_for_date(
                 "away_pitcher_era", "home_pitcher_era",
                 "pred_away_runs", "pred_home_runs", "pred_total",
                 "pred_score_away", "pred_score_home",
-                "ou_line", "ou_pick", "ou_p_over",
+                "ou_line", "ou_pick", "ou_p_over", "ou_market", "ml_home", "ml_away",
                 "game_time", "venue",
             ]
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
@@ -1122,6 +1163,9 @@ def run_predictions_for_date(
                     "ou_line": pred.get("ou_line", ""),
                     "ou_pick": pred.get("ou_pick", ""),
                     "ou_p_over": round(pred.get("ou_p_over") or 0, 2) if pred.get("ou_p_over") is not None else "",
+                    "ou_market": pred.get("ou_market") or game.get("ou_market") or "",
+                    "ml_home": pred.get("ml_home") if pred.get("ml_home") is not None else game.get("ml_home", ""),
+                    "ml_away": pred.get("ml_away") if pred.get("ml_away") is not None else game.get("ml_away", ""),
                     "game_time": pred.get("game_time", ""),
                     "venue": game.get("venue", ""),
                 })
@@ -1287,7 +1331,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--ou-line",
         type=float,
         default=None,
-        help="Línea de over/under (carreras). Por defecto: 8.5 para todos los partidos",
+        help="Solo para debug: ignora el mercado ESPN y usa esta línea en todos",
     )
     pr.set_defaults(func=cmd_predict)
 
