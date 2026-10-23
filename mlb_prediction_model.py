@@ -12,9 +12,9 @@ import csv
 import os
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List, Tuple
+from typing import Any, Optional, Dict, List, Tuple
 from pathlib import Path
 
 from espn_api import EspnMlbClient, merge_espn_into_games
@@ -372,8 +372,7 @@ class MLBPredictor:
                 return abbr.upper()
         return "UNK"
     
-    def get_games_for_date(self, date_str: str) -> List[Dict]:
-        games = self.api.schedule(date=date_str)
+    def _attach_abbrs_and_odds(self, games: List[Dict], espn_date: str) -> List[Dict]:
         for game in games:
             hid = game.get("home_team_id")
             aid = game.get("away_team_id")
@@ -382,12 +381,80 @@ class MLBPredictor:
             if not game.get("away_team_abbr") and aid:
                 game["away_team_abbr"] = self.get_team_abbreviation(int(aid))
         try:
-            espn_rows = self.espn.scoreboard_around(date_str)
+            espn_rows = self.espn.scoreboard_around(espn_date)
             if espn_rows:
                 merge_espn_into_games(games, espn_rows)
         except Exception as exc:
             print(f"  ⚠️  No se pudieron cruzar líneas ESPN: {exc}")
         return games
+
+    def get_games_for_date(self, date_str: str) -> List[Dict]:
+        games = self.api.schedule(date=date_str)
+        return self._attach_abbrs_and_odds(games, date_str)
+
+    def get_todays_games(self) -> List[Dict]:
+        """Hoy en hora local + juegos de noche que la API fecha al día UTC siguiente."""
+        local = datetime.now()
+        start = (local - timedelta(days=1)).strftime("%Y-%m-%d")
+        end = (local + timedelta(days=1)).strftime("%Y-%m-%d")
+        raw = self.api.schedule(start_date=start, end_date=end)
+        now_utc = datetime.utcnow()
+        by_pk: Dict[Any, Dict] = {}
+        for game in raw:
+            pk = game.get("game_pk")
+            if pk is None:
+                continue
+            by_pk[pk] = game
+        live = {"I", "IR", "IW", "P", "PW", "PRE"}
+        done = {"F", "FT", "FR", "O"}
+        out: List[Dict] = []
+        for game in by_pk.values():
+            st = str(game.get("status") or "")
+            if st in done:
+                continue
+            if st in live:
+                out.append(game)
+                continue
+            t = str(game.get("time") or "")
+            try:
+                start_utc = datetime.strptime(t[:16], "%Y-%m-%dT%H:%M")
+                hours = (start_utc - now_utc).total_seconds() / 3600.0
+            except ValueError:
+                hours = 0.0
+            if -5.0 <= hours <= 18.0:
+                out.append(game)
+        out.sort(key=lambda g: str(g.get("time") or ""))
+        return self._attach_abbrs_and_odds(out, local.strftime("%Y-%m-%d"))
+
+    def get_games_for_local_day(self, date_str: str) -> List[Dict]:
+        """Partidos de esa fecha en hora local (un 00:00 UTC es la noche del día anterior)."""
+        target = datetime.strptime(date_str, "%Y-%m-%d").date()
+        start = (target - timedelta(days=1)).strftime("%Y-%m-%d")
+        end = (target + timedelta(days=1)).strftime("%Y-%m-%d")
+        raw = self.api.schedule(start_date=start, end_date=end)
+        by_pk: Dict = {}
+        for game in raw:
+            pk = game.get("game_pk")
+            if pk is not None:
+                by_pk[pk] = game
+        out: List[Dict] = []
+        for game in by_pk.values():
+            local_d = None
+            t = str(game.get("time") or "")
+            try:
+                utc = datetime.strptime(t[:16], "%Y-%m-%dT%H:%M").replace(tzinfo=timezone.utc)
+                local_d = utc.astimezone().date()
+            except ValueError:
+                ds = str(game.get("date") or "")
+                if ds:
+                    try:
+                        local_d = datetime.strptime(ds[:10], "%Y-%m-%d").date()
+                    except ValueError:
+                        local_d = None
+            if local_d == target:
+                out.append(game)
+        out.sort(key=lambda g: str(g.get("time") or ""))
+        return self._attach_abbrs_and_odds(out, date_str)
     
     def get_game_live_details(self, game_pk: int) -> Dict:
         data = self.api.boxscore(game_pk)
@@ -898,6 +965,12 @@ class MLBPredictor:
             out.append(
                 f"🏁 FINAL: {away_abbr} {game.get('away_score', '')} - {game.get('home_score', '')} {home_abbr}"
             )
+        elif game.get("status") in ("I", "IR", "IW"):
+            inn = game.get("current_inning") or ""
+            state = game.get("inning_state") or "en juego"
+            out.append(
+                f"🔴 EN JUEGO ({state} {inn}): {away_abbr} {game.get('away_score', '')} - {game.get('home_score', '')} {home_abbr}"
+            )
         away_pn = prediction.get("away_pitcher_name") or game.get("away_pitcher_name") or ""
         home_pn = prediction.get("home_pitcher_name") or game.get("home_pitcher_name") or ""
         if away_pn or home_pn:
@@ -982,6 +1055,8 @@ class MLBPredictor:
             ar = float(prediction.get("pred_away_runs") or 0)
             ou_line = float(prediction.get("ou_line") or 0)
             pick = prediction.get("ou_pick") or "UNDER"
+            if pick not in ("OVER", "UNDER"):
+                pick = "OVER" if float(prediction.get("ou_diff") or 0) >= 0 else "UNDER"
             p_over = float(prediction.get("ou_p_over") or 50)
             p_under = float(prediction.get("ou_p_under") or 50)
             diff = float(prediction.get("ou_diff") or 0)
@@ -989,25 +1064,29 @@ class MLBPredictor:
             sa = prediction.get("score_away")
             if sh is not None and sa is not None:
                 out.append(f"🎯 MARCADOR: {away_abbr} {int(sa)} - {int(sh)} {home_abbr}")
-            out.append(f"   Esperado (promedio): {away_abbr} {ar:.1f}  @  {home_abbr} {hr:.1f}  ·  total {float(pred_total):.1f}")
+            out.append("🎯 PREDICCIÓN DE CARRERAS:")
+            out.append(f"   {home_abbr}: {hr:.1f} carreras")
+            out.append(f"   {away_abbr}: {ar:.1f} carreras")
+            out.append(f"   Total: {float(pred_total):.1f} carreras")
             out.append("")
             side_p = p_over if pick == "OVER" else p_under
-            src = "mercado ESPN" if prediction.get("ou_market") else "línea"
-            out.append(f"🧾 O/U {ou_line:g} ({src}): {pick}  ({pick.lower()} prob: {side_p:.0f}%)")
-            ml_h = prediction.get("ml_home")
-            ml_a = prediction.get("ml_away")
-            if ml_h is not None or ml_a is not None:
-                def _ml(v):
-                    if v is None:
-                        return "—"
-                    n = int(v)
-                    return f"+{n}" if n > 0 else str(n)
-                out.append(f"   Moneyline ESPN: {away_abbr} {_ml(ml_a)}  |  {home_abbr} {_ml(ml_h)}")
-            for i, row in enumerate(prediction.get("ou_fac") or [], start=1):
-                out.append(f"   {i}. {row}")
-            if not prediction.get("ou_fac"):
-                vs = "por encima" if diff > 0 else "por debajo"
-                out.append(f"   → Total predicho {float(pred_total):.1f} {vs} de la línea ({diff:+.1f})")
+            out.append(f"🧾 O/U {ou_line:g}: {pick}  ({pick.lower()} prob: {side_p:.0f}%)")
+            hrs = float(hctx.get("rs") or 4.5)
+            hra = float(hctx.get("ra") or 4.5)
+            ars = float(actx.get("rs") or 4.5)
+            ara = float(actx.get("ra") or 4.5)
+            side_home = 0.5 * hrs + 0.5 * ara
+            side_away = 0.5 * ars + 0.5 * hra
+            out.append(
+                f"   → Ofensiva local {home_abbr} ({hrs:.1f}) vs Defensa visitante {away_abbr} ({ara:.1f}) "
+                f"[últimos 5 juegos] → ~{side_home:.1f} R esperadas de ese lado"
+            )
+            out.append(
+                f"   → Ofensiva visitante {away_abbr} ({ars:.1f}) vs Defensa local {home_abbr} ({hra:.1f}) "
+                f"[últimos 5 juegos] → ~{side_away:.1f} R esperadas de ese lado"
+            )
+            vs = "por encima" if diff > 0 else "por debajo"
+            out.append(f"   → Total predicho {float(pred_total):.1f} {vs} de la línea ({diff:+.1f})")
             out.append("")
             away_p01 = away_prob / 100.0
             out.append(
@@ -1064,7 +1143,7 @@ def sync_daily():
 
 def run_predictions_for_date(
     model: MLBPredictor,
-    date_to_use: str,
+    date_to_use: str | None,
     save_csv: bool = True,
     ou_line: float | None = None,
 ):
@@ -1073,13 +1152,13 @@ def run_predictions_for_date(
     from pathlib import Path
     
     today = datetime.now().strftime("%Y-%m-%d")
-    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-    
-    if date_to_use not in [today, yesterday]:
-        print(f"\n⚠️  Fecha {date_to_use} no está en caché. Descargando...")
-        games = model.get_games_for_date(date_to_use)
+    if date_to_use is None:
+        games = model.get_todays_games()
+        date_to_use = today
+        print("\n📅 Slate de hoy (incluye juegos en curso / noche, no solo la fecha UTC).")
     else:
-        games = model.get_games_for_date(date_to_use)
+        print(f"\n📅 Predicciones para {date_to_use} (hora local).")
+        games = model.get_games_for_local_day(date_to_use)
     
     if not games:
         print("❌ No hay partidos programados para esta fecha.")
@@ -1161,7 +1240,15 @@ def run_predictions_for_date(
                     "pred_score_away": pred.get("score_away", ""),
                     "pred_score_home": pred.get("score_home", ""),
                     "ou_line": pred.get("ou_line", ""),
-                    "ou_pick": pred.get("ou_pick", ""),
+                    "ou_pick": (
+                        pred.get("ou_pick")
+                        if pred.get("ou_pick") in ("OVER", "UNDER")
+                        else (
+                            "OVER"
+                            if float(pred.get("ou_diff") or 0) >= 0
+                            else "UNDER"
+                        )
+                    ),
                     "ou_p_over": round(pred.get("ou_p_over") or 0, 2) if pred.get("ou_p_over") is not None else "",
                     "ou_market": pred.get("ou_market") or game.get("ou_market") or "",
                     "ml_home": pred.get("ml_home") if pred.get("ml_home") is not None else game.get("ml_home", ""),
@@ -1185,27 +1272,124 @@ def get_date_input(prompt: str = "Fecha (YYYY-MM-DD) [ENTER = hoy]: ") -> str:
         return get_date_input(prompt)
 
 
+_WEEKDAYS_ES = (
+    "lunes",
+    "martes",
+    "miércoles",
+    "jueves",
+    "viernes",
+    "sábado",
+    "domingo",
+)
+
+
+def _weekday_es(d: date) -> str:
+    return _WEEKDAYS_ES[d.weekday()]
+
+
+def pick_other_day() -> str | None:
+    """Menú para predecir un día que no sea hoy / mañana / ayer."""
+    today = date.today()
+    nearby: list[date] = []
+    for delta in range(-5, 8):
+        if delta in (-1, 0, 1):
+            continue
+        nearby.append(today + timedelta(days=delta))
+
+    print()
+    print("📅 Predicciones de otro día")
+    print("   (hoy, mañana y ayer ya están en el menú principal)")
+    print()
+    for i, d in enumerate(nearby, start=1):
+        print(f"  {i} — {d.isoformat()}  ({_weekday_es(d)})")
+    print("  F — Escribir fecha YYYY-MM-DD")
+    print("  0 — Volver")
+    print()
+
+    raw = input("Elige una opción: ").strip().upper()
+    if not raw or raw == "0":
+        return None
+    if raw == "F":
+        return get_date_input("Fecha (YYYY-MM-DD) [ENTER = hoy]: ")
+    if raw.isdigit():
+        idx = int(raw)
+        if 1 <= idx <= len(nearby):
+            return nearby[idx - 1].isoformat()
+        print("❌ Número fuera de rango.")
+        return None
+    try:
+        datetime.strptime(raw, "%Y-%m-%d")
+        return raw
+    except ValueError:
+        print("❌ Opción inválida. Usa un número, F, o YYYY-MM-DD.")
+        return None
+
+
 def show_menu():
     print()
     print("=" * 60)
     print("⚾  MLB PREDICT - MENÚ PRINCIPAL")
     print("=" * 60)
     print()
-    print("  1 — 📅 Ver partidos de HOY")
-    print("  2 — 📆 Ver partidos de AYER")
-    print("  3 — 📅 Elegir fecha específica")
+    print("  1 — 📥 Sincronizar datos (ayer + stats)")
+    print("  2 — ⬇️  Descargar historial 2010 → hoy")
+    print("  3 — 🏋️  Entrenar modelo")
+    print("  4 — ▶️  Pipeline (historial + entrenar)")
     print()
-    print("  4 — 🔄 Sincronizar datos (ayer + stats)")
-    print()
-    print("  5 — 📄 Exportar CSV de hoy")
-    print("  6 — 📄 Exportar CSV de ayer")
-    print()
-    print("  A — ⬇️  Descargar historial (2010 → hoy)")
-    print("  T — 🏋️  Entrenar modelo (as-of, holdout 2026)")
+    print("  5 — 🔮 Predecir HOY (en juego / noche)")
+    print("  6 — 📅 Predecir MAÑANA")
+    print("  7 — 📆 Predecir AYER")
+    print("  8 — 📅 Predecir OTRO DÍA (lista o fecha)")
+    print("  9 — 🎯 Partido suelto (visitante @ local)")
     print()
     print("  0 — 🚪 Salir")
     print()
     print("=" * 60)
+
+
+def _pause() -> None:
+    input("\n⏎ Presiona ENTER para continuar...")
+
+
+def _codes_hint() -> str:
+    return ", ".join(k.upper() for k in TEAM_IDS)
+
+
+def _predict_one_game() -> None:
+    print("\nCódigos MLB:", _codes_hint())
+    away = input("Visitante (ej. MIL): ").strip().lower()
+    home = input("Local (ej. LAD): ").strip().lower()
+    if away not in TEAM_IDS or home not in TEAM_IDS:
+        print("❌ Código no válido. Usa uno de la lista (ej. TB, CLE, LAD).")
+        return
+    ds = get_date_input("Fecha (YYYY-MM-DD) [ENTER = hoy]: ")
+    model = MLBPredictor()
+    games = model.get_games_for_local_day(ds)
+    hid, aid = TEAM_IDS[home], TEAM_IDS[away]
+    match = [
+        g
+        for g in games
+        if int(g.get("home_team_id") or 0) == hid and int(g.get("away_team_id") or 0) == aid
+    ]
+    game = match[0] if match else {
+        "home_team_id": hid,
+        "away_team_id": aid,
+        "date": ds,
+        "venue": "",
+        "game_type": "R",
+        "status": "S",
+        "home_team_abbr": home.upper(),
+        "away_team_abbr": away.upper(),
+    }
+    if not match:
+        print("  ℹ️  No hay ese partido en el calendario; se predice el cruce igual.")
+    pred = model.predict_game(home_team_id=hid, away_team_id=aid, game=game)
+    print()
+    print("=" * 80)
+    print("⚾ PREDICCIONES - PARTIDO")
+    print("=" * 80)
+    print()
+    print(model.format_prediction(game, pred))
 
 
 def cmd_menu(_args: argparse.Namespace | None = None) -> int:
@@ -1214,56 +1398,45 @@ def cmd_menu(_args: argparse.Namespace | None = None) -> int:
         choice = input("Elige una opción: ").strip().upper()
 
         if choice == "1":
-            date_to_use = datetime.now().strftime("%Y-%m-%d")
-            model = MLBPredictor()
-            run_predictions_for_date(model, date_to_use)
-            input("\n⏎ Presiona ENTER para continuar...")
-
-        elif choice == "2":
-            date_to_use = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-            model = MLBPredictor()
-            run_predictions_for_date(model, date_to_use)
-            input("\n⏎ Presiona ENTER para continuar...")
-
-        elif choice == "3":
-            date_to_use = get_date_input()
-            model = MLBPredictor()
-            run_predictions_for_date(model, date_to_use)
-            input("\n⏎ Presiona ENTER para continuar...")
-
-        elif choice == "4":
             sync_daily()
-            input("\n⏎ Presiona ENTER para continuar...")
-
-        elif choice == "5":
-            date_to_use = datetime.now().strftime("%Y-%m-%d")
-            model = MLBPredictor()
-            print(f"\n📄 Exportando CSV para {date_to_use}...")
-            run_predictions_for_date(model, date_to_use, save_csv=True)
-            input("\n⏎ Presiona ENTER para continuar...")
-
-        elif choice == "6":
-            date_to_use = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-            model = MLBPredictor()
-            print(f"\n📄 Exportando CSV para {date_to_use}...")
-            run_predictions_for_date(model, date_to_use, save_csv=True)
-            input("\n⏎ Presiona ENTER para continuar...")
-
-        elif choice == "A":
+            _pause()
+        elif choice == "2":
             download_history(2010)
-            input("\n⏎ Presiona ENTER para continuar...")
-
-        elif choice == "T":
+            _pause()
+        elif choice == "3":
             cmd_train(argparse.Namespace(holdout=str(datetime.now().year)))
-            input("\n⏎ Presiona ENTER para continuar...")
-
+            _pause()
+        elif choice == "4":
+            print("\n▶️  Pipeline: historial 2010+ y entrenamiento...\n")
+            download_history(2010)
+            cmd_train(argparse.Namespace(holdout=str(datetime.now().year)))
+            print("\n✅ Pipeline completado.\n")
+            _pause()
+        elif choice == "5":
+            run_predictions_for_date(MLBPredictor(), None)
+            _pause()
+        elif choice == "6":
+            ds = (date.today() + timedelta(days=1)).isoformat()
+            run_predictions_for_date(MLBPredictor(), ds)
+            _pause()
+        elif choice == "7":
+            ds = (date.today() - timedelta(days=1)).isoformat()
+            run_predictions_for_date(MLBPredictor(), ds)
+            _pause()
+        elif choice == "8":
+            other = pick_other_day()
+            if other:
+                run_predictions_for_date(MLBPredictor(), other)
+            _pause()
+        elif choice == "9":
+            _predict_one_game()
+            _pause()
         elif choice == "0":
-            print("\n🚪 ¡Hasta luego!")
+            print("\n🚪 ¡Hasta luego! ⚾\n")
             break
-
         else:
             print("\n❌ Opción inválida. Intenta de nuevo.")
-            input("\n⏎ Presiona ENTER para continuar...")
+            _pause()
     return 0
 
 
@@ -1286,12 +1459,13 @@ def cmd_train(args: argparse.Namespace) -> int:
 
 
 def cmd_predict(args: argparse.Namespace) -> int:
-    date_to_use = getattr(args, "date", None) or datetime.now().strftime("%Y-%m-%d")
-    try:
-        datetime.strptime(date_to_use, "%Y-%m-%d")
-    except ValueError:
-        print("❌ Formato inválido. Usa --date YYYY-MM-DD")
-        return 1
+    date_to_use = getattr(args, "date", None)
+    if date_to_use:
+        try:
+            datetime.strptime(date_to_use, "%Y-%m-%d")
+        except ValueError:
+            print("❌ Formato inválido. Usa --date YYYY-MM-DD")
+            return 1
     model = MLBPredictor()
     ou = getattr(args, "ou_line", None)
     run_predictions_for_date(model, date_to_use, ou_line=ou)

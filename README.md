@@ -43,7 +43,7 @@ python3 scripts/05_predict.py --date 2026-05-05
 
 Imprime las predicciones en consola y escribe `predictions_<fecha>.csv` en la raíz del repo.
 
-**Menú interactivo** (hoy / ayer / fecha / sync / exportar CSV):
+**Menú interactivo** (mismo estilo que NHL: datos, pipeline y predicción):
 
 ```bash
 python3 scripts/00_menu.py
@@ -53,14 +53,15 @@ python3 scripts/00_menu.py
 
 | Opción | Qué hace |
 |--------|-----------|
-| **1** | Lista predicciones para todos los partidos **de hoy** (fecha local del sistema). |
-| **2** | Igual, pero para **ayer**. |
-| **3** | Pide una fecha en consola; usa **`YYYY-MM-DD`** (ej. `2026-05-05`). Enter sin texto = hoy. |
-| **4** | Sincroniza datos (partidos finalizados de ayer + estadísticas de equipos). |
-| **5** | Misma lógica que **1**, mostrando mensaje de exportación; enfocado en CSV de hoy. |
-| **6** | Misma lógica que **2**, para CSV de ayer. |
-| **A** | Descarga historial **2010 → hoy** a `data/games_history.csv`. |
-| **T** | Entrena el modelo (features sin futuro; holdout = temporada actual). |
+| **1** | Sincroniza datos (partidos de ayer + stats de equipos). |
+| **2** | Descarga historial **2010 → hoy** a `data/games_history.csv`. |
+| **3** | Entrena el modelo (features as-of; holdout = temporada actual). |
+| **4** | Pipeline: historial + entrenar. |
+| **5** | Predice **hoy** (incluye juegos en curso y de noche). |
+| **6** | Predice **mañana** (hora local; un 00:00 UTC cuenta como noche del día anterior). |
+| **7** | Predice **ayer**. |
+| **8** | Predice **otro día**: lista de fechas cercanas, o escribe `YYYY-MM-DD`. |
+| **9** | Partido suelto: visitante @ local (códigos tipo `MIL`, `LAD`). |
 | **0** | Salir. |
 
 Tras cada acción el programa puede pedir que pulses **Enter** para volver al menú.
